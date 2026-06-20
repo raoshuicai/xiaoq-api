@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -889,78 +890,79 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
     full_response = ""
     try:
         has_tokens = False
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            async with client.stream(
-                "POST",
-                f"{HERMES_API}/v1/chat/completions",
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else "",
-                    "X-Hermes-Session-Id": session_id,
-                    "X-Hermes-Skip-Approval": "true",
-                },
-            ) as resp:
-                if resp.status_code != 200:
-                    error_body = await resp.aread()
-                    print(f"[WS] Hermes API error {resp.status_code}: {error_body[:200]}")
-                    if client_connected:
-                        try:
-                            await websocket.send_json({"type": "chat_error", "message": f"API error {resp.status_code}"})
-                        except Exception:
-                            pass
-                    active_streams.pop(session_id, None)
-                    return
+        async with asyncio.timeout(300):  # 方案: 总超时5分钟
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{HERMES_API}/v1/chat/completions",
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else "",
+                        "X-Hermes-Session-Id": session_id,
+                        "X-Hermes-Skip-Approval": "true",
+                    },
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        print(f"[WS] Hermes API error {resp.status_code}: {error_body[:200]}")
+                        if client_connected:
+                            try:
+                                await websocket.send_json({"type": "chat_error", "message": f"API error {resp.status_code}"})
+                            except Exception:
+                                pass
+                        active_streams.pop(session_id, None)
+                        return
 
-                buffer = ""
-                async for chunk in resp.aiter_bytes():
-                    text = chunk.decode() if isinstance(chunk, bytes) else str(chunk)
-                    buffer += text
-                    # SSE events are separated by \n\n
-                    while "\n\n" in buffer:
-                        event, buffer = buffer.split("\n\n", 1)
-                        for line in event.strip().split("\n"):
-                            line = line.strip()
-                            if line.startswith("data: "):
-                                raw = line[6:].strip()
-                                if raw == "[DONE]":
-                                    if client_connected:
+                    buffer = ""
+                    async for chunk in resp.aiter_bytes():
+                        text = chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+                        buffer += text
+                        # SSE events are separated by \n\n
+                        while "\n\n" in buffer:
+                            event, buffer = buffer.split("\n\n", 1)
+                            for line in event.strip().split("\n"):
+                                line = line.strip()
+                                if line.startswith("data: "):
+                                    raw = line[6:].strip()
+                                    if raw == "[DONE]":
+                                        if client_connected:
+                                            try:
+                                                await websocket.send_json({"type": "chat_done"})
+                                            except Exception:
+                                                client_connected = False
+                                    elif raw:
                                         try:
-                                            await websocket.send_json({"type": "chat_done"})
-                                        except Exception:
-                                            client_connected = False
-                                elif raw:
-                                    try:
-                                        evt = json.loads(raw)
-                                        choices = evt.get("choices", [{}])
-                                        if choices:
-                                            delta = choices[0].get("delta", {})
-                                            content = delta.get("content", "")
-                                            if content:
-                                                has_tokens = True
-                                                full_response += content
-                                                # 分配序列号
-                                                seq = active_streams[session_id]["seq"]
-                                                active_streams[session_id]["seq"] = seq + 1
-                                                active_streams[session_id]["full_response"] = full_response
+                                            evt = json.loads(raw)
+                                            choices = evt.get("choices", [{}])
+                                            if choices:
+                                                delta = choices[0].get("delta", {})
+                                                content = delta.get("content", "")
+                                                if content:
+                                                    has_tokens = True
+                                                    full_response += content
+                                                    # 分配序列号
+                                                    seq = active_streams[session_id]["seq"]
+                                                    active_streams[session_id]["seq"] = seq + 1
+                                                    active_streams[session_id]["full_response"] = full_response
                                                 
-                                                if client_connected:
-                                                    try:
-                                                        await websocket.send_json({
-                                                            "type": "chat_token",
-                                                            "seq": seq,
-                                                            "content": content,
-                                                        })
-                                                    except Exception:
-                                                        print(f"[WS] 客户端意外断开，切换到后台流缓存模式 (session_id={session_id})")
-                                                        client_connected = False
-                                                # 无论客户端是否连接，都缓存 token
-                                                active_streams[session_id]["tokens"].append({
-                                                    "seq": seq,
-                                                    "content": content
-                                                })
-                                    except json.JSONDecodeError:
-                                        pass
+                                                    if client_connected:
+                                                        try:
+                                                            await websocket.send_json({
+                                                                "type": "chat_token",
+                                                                "seq": seq,
+                                                                "content": content,
+                                                            })
+                                                        except Exception:
+                                                            print(f"[WS] 客户端意外断开，切换到后台流缓存模式 (session_id={session_id})")
+                                                            client_connected = False
+                                                    # 无论客户端是否连接，都缓存 token
+                                                    active_streams[session_id]["tokens"].append({
+                                                        "seq": seq,
+                                                        "content": content
+                                                    })
+                                        except json.JSONDecodeError:
+                                            pass
         
         # 整个流处理完成
         if not client_connected:
@@ -986,6 +988,12 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         
         # 标记完成，保留 token 缓冲供后续 sync_pending 查询
         active_streams[session_id]["status"] = "complete"
+        active_streams[session_id]["completed_at"] = time.time()
+    except asyncio.TimeoutError:
+        print(f"[WS] Chat stream timeout for {session_id}")
+        active_streams[session_id]["status"] = "timeout"
+        active_streams[session_id]["completed_at"] = time.time()
+        active_streams[session_id].pop("reconnect_ws", None)
     except Exception as e:
         print(f"[WS] Chat stream error: {e}")
         if client_connected:
@@ -994,6 +1002,8 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
             except Exception:
                 pass
         active_streams[session_id]["status"] = "error"
+        active_streams[session_id]["completed_at"] = time.time()
+        active_streams[session_id].pop("reconnect_ws", None)
 
 # 推送API (HTTP 触发 WebSocket 推送)
 @app.post("/api/push/ws")
@@ -1139,6 +1149,29 @@ async def _push_to_huawei(title: str, body: str, source: str = "intel"):
     except Exception as e:
         print(f"[PushKit] Error: {e}")
 
+
+
+# ── 定期清理活跃流（防止内存泄漏）──────────────────────────────
+async def cleanup_stale_streams():
+    """清理超时的活跃流（completed/error/timeout 超过10分钟）"""
+    while True:
+        await asyncio.sleep(300)
+        now = time.time()
+        stale = [
+            sid for sid, s in list(active_streams.items())
+            if s.get("status") in ("complete", "error", "timeout")
+            and now - s.get("completed_at", 0) > 600
+        ]
+        for sid in stale:
+            active_streams.pop(sid, None)
+        if stale:
+            print(f"[Cleanup] Removed {len(stale)} stale streams")
+
+
+@app.on_event("startup")
+async def start_cleanup_task():
+    asyncio.create_task(cleanup_stale_streams())
+    print("[Startup] Stale stream cleanup task started")
 
 if __name__ == "__main__":
     import uvicorn
