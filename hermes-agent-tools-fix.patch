@@ -1,0 +1,108 @@
+From 8f3d62b8b2ad926ac4056f719ca367ae00338a49 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=B0=8FQ?= <592499073@qq.com>
+Date: Sat, 20 Jun 2026 09:59:51 +0800
+Subject: [PATCH] fix: xiaoq-api tools approval bypass via
+ X-Hermes-Skip-Approval header
+
+- approval.py: add _SKIP_APPROVAL context var, skip approval in
+  check_all_command_guards + check_execute_code_guard when set
+- api_server.py: read X-Hermes-Skip-Approval header, set context var,
+  propagate context to executor thread via copy_context()
+
+Fixes terminal/execute_code being BLOCKED for APP (xiaoq-api) calls.
+---
+ gateway/platforms/api_server.py | 13 ++++++++++++-
+ tools/approval.py               | 25 +++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index da86952a0..515bfc400 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -32,6 +32,7 @@ Requires:
+ """
+ 
+ import asyncio
++import contextvars
+ import hashlib
+ import hmac
+ import json
+@@ -1844,6 +1845,15 @@ class APIServerAdapter(BasePlatformAdapter):
+         model_name = body.get("model", self._model_name)
+         created = int(time.time())
+ 
++        # Trusted clients (e.g. xiaoq-api APP with API key) can skip
++        # interactive approval for terminal/execute_code via context var.
++        skip_approval = _coerce_request_bool(
++            request.headers.get("X-Hermes-Skip-Approval", ""), default=False
++        )
++        if skip_approval:
++            from tools.approval import set_skip_approval
++            set_skip_approval(True)
++
+         if stream:
+             import queue as _q
+             _stream_q: _q.Queue = _q.Queue()
+@@ -3557,7 +3567,8 @@ class APIServerAdapter(BasePlatformAdapter):
+             finally:
+                 clear_session_vars(tokens)
+ 
+-        return await loop.run_in_executor(None, _run)
++        ctx = contextvars.copy_context()
++        return await loop.run_in_executor(None, ctx.run, _run)
+ 
+     # ------------------------------------------------------------------
+     # /v1/runs — structured event streaming
+diff --git a/tools/approval.py b/tools/approval.py
+index 6e4cca276..4d40da2eb 100644
+--- a/tools/approval.py
++++ b/tools/approval.py
+@@ -24,6 +24,23 @@ from utils import env_var_enabled, is_truthy_value
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Context var for trusted clients (e.g. xiaoq-api APP) to skip
++# interactive approval.  Set by api_server.py when the caller
++# presents an API key AND the X-Hermes-Skip-Approval header.
++# Thread-safe: contextvars propagate into executor threads.
++_SKIP_APPROVAL: contextvars.ContextVar[bool] = contextvars.ContextVar(
++    "_skip_approval", default=False
++)
++
++
++def set_skip_approval(value: bool) -> contextvars.Token:
++    """Set the skip-approval flag for the current async context.
++
++    Returns a token; call ``contextvars.ContextVar.reset(token)`` to restore.
++    """
++    return _SKIP_APPROVAL.set(value)
++
++
+ # Freeze YOLO mode at module import time. Reading os.environ on every call
+ # would allow any skill running inside the process to set this variable and
+ # instantly bypass all approval checks — a prompt-injection escalation path.
+@@ -1411,6 +1428,10 @@ def check_all_command_guards(command: str, env_type: str,
+     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+         return {"approved": True, "message": None}
+ 
++    # Trusted clients (e.g. xiaoq-api APP with API key) skip interactive approval.
++    if _SKIP_APPROVAL.get():
++        return {"approved": True, "message": None}
++
+     if _command_matches_permanent_allowlist(command):
+         return {"approved": True, "message": None}
+ 
+@@ -1707,6 +1728,10 @@ def check_execute_code_guard(code: str, env_type: str) -> dict:
+     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+         return {"approved": True, "message": None}
+ 
++    # Trusted clients (e.g. xiaoq-api APP with API key) skip interactive approval.
++    if _SKIP_APPROVAL.get():
++        return {"approved": True, "message": None}
++
+     is_gateway = _is_gateway_approval_context()
+     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+ 
+-- 
+2.43.0
+
