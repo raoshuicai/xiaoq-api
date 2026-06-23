@@ -461,10 +461,14 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
     if not text:
         raise HTTPException(status_code=400, detail="body or text is required")
 
+    # 追加发送时间到消息体末尾
+    now_str = datetime.now(TZ).strftime("%m-%d %H:%M")
+    text_with_time = f"{text}\n—— {now_str}"
+
     db = sqlite3.connect(str(PUSH_DB))
     cur = db.execute(
         "INSERT INTO push_messages (title, body, source) VALUES (?, ?, ?)",
-        (title, text, source),
+        (title, text_with_time, source),
     )
     msg_id = cur.lastrowid
     db.commit()
@@ -483,7 +487,7 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
 
     # 同步执行推送和广播
     try:
-        await _push_to_huawei(title, text, source)
+        await _push_to_huawei(title, text_with_time, source)
     except Exception as e:
         print(f"[PushKit] Error: {e}")
     # 写入离线对话缓存（APP sync_pending 可拉取，显示在对话列表中）
@@ -492,7 +496,7 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
         existing = db2.execute(
             "SELECT content FROM offline_chats WHERE session_id = '__push_inbox__'"
         ).fetchone()
-        new_entry = f"[{title}]\n{text}\n---\n"
+        new_entry = f"[{title}]\n{text_with_time}\n---\n"
         if existing:
             new_entry = existing[0] + "\n" + new_entry
         db2.execute(
@@ -505,7 +509,7 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
         print(f"[PushKit] offline_chats write error: {e}")
     await push_events.broadcast(message)
     await manager.broadcast({
-        "type": "notification", "title": title, "body": text, "source": source
+        "type": "notification", "title": title, "body": text_with_time, "source": source
     })
 
     return {"status": "ok", "message": message}
