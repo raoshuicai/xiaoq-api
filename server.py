@@ -801,14 +801,25 @@ async def websocket_push(websocket: WebSocket):
     try:
         # 发送连接成功确认
         await websocket.send_json({"type": "connected", "client_id": client_id})
-        # 自动补推未读推送消息（APP断线期间错过的通知）
+        # 自动补推未读推送消息（增量：只推上次重连之后的新消息）
         try:
+            last_id_file = Path(os.path.expanduser("~/.hermes/last_auto_push_id.txt"))
+            last_id = 0
+            if last_id_file.exists():
+                try:
+                    last_id = int(last_id_file.read_text().strip())
+                except ValueError:
+                    pass
+
             db = sqlite3.connect(str(PUSH_DB))
             unread = db.execute(
-                "SELECT id, title, body, source, created_at FROM push_messages WHERE read_at IS NULL ORDER BY id DESC LIMIT 50"
+                "SELECT id, title, body, source, created_at FROM push_messages "
+                "WHERE id > ? ORDER BY id ASC LIMIT 50",
+                (last_id,)
             ).fetchall()
             db.close()
-            for row in reversed(unread):
+
+            for row in unread:
                 await websocket.send_json({
                     "type": "notification",
                     "id": row[0],
@@ -817,8 +828,12 @@ async def websocket_push(websocket: WebSocket):
                     "source": row[3],
                     "created_at": row[4],
                 })
+
             if unread:
-                print(f"[WS] Auto-pushed {len(unread)} missed notifications to {client_id}")
+                new_last_id = unread[-1][0]
+                last_id_file.parent.mkdir(parents=True, exist_ok=True)
+                last_id_file.write_text(str(new_last_id))
+                print(f"[WS] Auto-pushed {len(unread)} new notifications (id {unread[0][0]}→{new_last_id}) to {client_id}")
         except Exception as e:
             print(f"[WS] Auto-push error: {e}")
         # 保持连接，等待消息
