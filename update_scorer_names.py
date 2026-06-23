@@ -4,11 +4,10 @@
 每天跑一次，新增射手自动翻译，不用手动维护
 """
 import json
-import os
-import sys
 from pathlib import Path
 
 import httpx
+from deep_translator import GoogleTranslator
 
 # ── 配置 ──
 API_URL = "https://worldcup26.ir/get/games"
@@ -22,12 +21,6 @@ SPELLING_ALIASES = {
     "Mohamed Mhbi": "穆赫比",           # API拼写 vs 标准: Mohammad Mohebi
     "Ramin Rzaiian": "雷扎伊安"          # API拼写 vs 标准: Ramin Rezaiian
 }
-
-# 翻译用 DeepSeek（兼容 OpenAI 格式），有 OpenRouter key 时走 OpenRouter
-TRANSLATION_KEY = os.getenv("DEEPSEEK_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
-TRANSLATION_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-TRANSLATION_MODEL = "deepseek-chat"
-
 
 def fetch_scorers() -> set:
     """从 API 采集所有射手英文名（HTTP/2 直连，绕过代理，自动重试）"""
@@ -95,46 +88,22 @@ def save_mapping(mapping: dict):
 
 
 def translate_names(names: list) -> dict:
-    """用 LLM 批量翻译英文球员名为中文"""
+    """用 Google Translate 免费网页翻译英文球员名为中文"""
     if not names:
         return {}
-    if not TRANSLATION_KEY:
-        print("[WARN] no LLM API key, skip translation")
-        return {n: n for n in names}
-
-    prompt = (
-        "将以下足球运动员英文名翻译为中文名。"
-        "只返回JSON格式 {\"英文名\": \"中文名\", ...}，不要其他文字。\n\n"
-        + json.dumps(names, ensure_ascii=False)
-    )
-
-    try:
-        with httpx.Client(http2=True) as client:
-            resp = client.post(
-                f"{TRANSLATION_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {TRANSLATION_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": TRANSLATION_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0,
-                },
-                timeout=30,
-            )
-            content = resp.json()["choices"][0]["message"]["content"]
-        # 提取 JSON 部分
-        if "```" in content:
-            content = content.split("```")[1]
-            if content.startswith("json"):
-                content = content[4:]
-        result = json.loads(content.strip())
-        print(f"[OK] translated {len(result)} names")
-        return result
-    except Exception as e:
-        print(f"[WARN] translation failed: {e}")
-        return {n: n for n in names}
+    
+    translator = GoogleTranslator(source='auto', target='zh-CN')
+    result = {}
+    for name in names:
+        try:
+            cn = translator.translate(name)
+            result[name] = cn if cn and cn != name else name
+        except Exception as e:
+            print(f"[WARN] translate '{name}' failed: {e}, keep original")
+            result[name] = name
+    
+    print(f"[OK] translated {len(result)} names via Google Translate")
+    return result
 
 
 def main():

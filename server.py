@@ -486,6 +486,23 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
         await _push_to_huawei(title, text, source)
     except Exception as e:
         print(f"[PushKit] Error: {e}")
+    # 写入离线对话缓存（APP sync_pending 可拉取，显示在对话列表中）
+    try:
+        db2 = sqlite3.connect(str(PUSH_DB))
+        existing = db2.execute(
+            "SELECT content FROM offline_chats WHERE session_id = '__push_inbox__'"
+        ).fetchone()
+        new_entry = f"[{title}]\n{text}\n---\n"
+        if existing:
+            new_entry = existing[0] + "\n" + new_entry
+        db2.execute(
+            "INSERT OR REPLACE INTO offline_chats (session_id, content) VALUES ('__push_inbox__', ?)",
+            (new_entry,)
+        )
+        db2.commit()
+        db2.close()
+    except Exception as e:
+        print(f"[PushKit] offline_chats write error: {e}")
     await push_events.broadcast(message)
     await manager.broadcast({
         "type": "notification", "title": title, "body": text, "source": source
@@ -784,6 +801,26 @@ async def websocket_push(websocket: WebSocket):
     try:
         # 发送连接成功确认
         await websocket.send_json({"type": "connected", "client_id": client_id})
+        # 自动补推未读推送消息（APP断线期间错过的通知）
+        try:
+            db = sqlite3.connect(str(PUSH_DB))
+            unread = db.execute(
+                "SELECT id, title, body, source, created_at FROM push_messages WHERE read_at IS NULL ORDER BY id DESC LIMIT 50"
+            ).fetchall()
+            db.close()
+            for row in reversed(unread):
+                await websocket.send_json({
+                    "type": "notification",
+                    "id": row[0],
+                    "title": row[1],
+                    "body": row[2],
+                    "source": row[3],
+                    "created_at": row[4],
+                })
+            if unread:
+                print(f"[WS] Auto-pushed {len(unread)} missed notifications to {client_id}")
+        except Exception as e:
+            print(f"[WS] Auto-push error: {e}")
         # 保持连接，等待消息
         while True:
             data = await websocket.receive_json()
