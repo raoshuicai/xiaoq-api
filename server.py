@@ -1025,11 +1025,61 @@ async def push_via_websocket(data: dict):
 import json as json_module
 from urllib.parse import urlencode
 
-# Push Kit 配置（从 .env 读取，需在AGC开启Push Kit后设置）
-PUSH_APP_ID = os.getenv("PUSH_APP_ID", "")
-PUSH_APP_SECRET = os.getenv("PUSH_APP_SECRET", "")
-PUSH_PROJECT_ID = os.getenv("PUSH_PROJECT_ID", "101653523864334050")  # AGC Sender ID
+# Push Kit 配置（HarmonyOS 5+ 使用 JWT 鉴权，不再支持 OAuth 2.0）
+PUSH_PROJECT_ID = os.getenv("PUSH_PROJECT_ID", "101653523864334050")
+PUSH_SERVICE_ACCOUNT_KEY = os.getenv("PUSH_SERVICE_ACCOUNT_KEY", "")  # 服务账号密钥JSON路径
 PUSH_TOKEN_FILE = Path(os.path.expanduser("~/.hermes/push_tokens.json"))
+
+# JWT 缓存（有效期1小时，避免每次推送都重新签名）
+_jwt_cache: dict = {"token": "", "expires_at": 0}
+
+def _generate_jwt() -> str:
+    """使用服务账号密钥生成 JWT，用于 Push Kit V3 鉴权"""
+    import base64
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.backends import default_backend
+
+    now = int(time.time())
+    # 缓存未过期直接返回
+    if _jwt_cache["token"] and _jwt_cache["expires_at"] > now + 60:
+        return _jwt_cache["token"]
+
+    key_path = Path(PUSH_SERVICE_ACCOUNT_KEY)
+    if not key_path.exists():
+        raise FileNotFoundError(f"Service account key not found: {key_path}")
+
+    key_data = json_module.loads(key_path.read_text())
+    private_key = key_data["private_key"]
+    key_id = key_data["key_id"]
+    sub_account = key_data["sub_account"]
+
+    pkey = serialization.load_pem_private_key(
+        private_key.encode(), password=None, backend=default_backend()
+    )
+
+    def _b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = {"alg": "RS256", "kid": key_id, "typ": "JWT"}
+    payload = {
+        "iss": sub_account,
+        "aud": "https://oauth-login.cloud.huawei.com/oauth2/v3/token",
+        "iat": now,
+        "exp": now + 3600,
+    }
+    header_b64 = _b64url(json_module.dumps(header).encode())
+    payload_b64 = _b64url(json_module.dumps(payload).encode())
+    signing_input = f"{header_b64}.{payload_b64}"
+
+    signature = pkey.sign(
+        signing_input.encode(), padding.PKCS1v15(), hashes.SHA256()
+    )
+    jwt = f"{signing_input}.{_b64url(signature)}"
+
+    _jwt_cache["token"] = jwt
+    _jwt_cache["expires_at"] = now + 3600
+    return jwt
 
 # 设备推送令牌存储
 def _load_push_tokens() -> list[dict]:
@@ -1070,11 +1120,11 @@ async def register_push_token(data: dict):
     return {"ok": True, "total": len(tokens)}
 
 async def _push_to_huawei(title: str, body: str, source: str = "intel"):
-    """通过华为Push Kit REST API推送消息到所有注册设备"""
+    """通过华为Push Kit REST API (JWT鉴权) 推送消息到所有注册设备"""
     print(f"[PushKit] Called: title={title}, body={body}")
-    if not PUSH_APP_ID or not PUSH_APP_SECRET:
-        print(f"[PushKit] Skipped: ID={'yes' if PUSH_APP_ID else 'no'}, Secret={'yes' if PUSH_APP_SECRET else 'no'}")
-        return  # 未配置 Push Kit，跳过
+    if not PUSH_SERVICE_ACCOUNT_KEY:
+        print("[PushKit] Skipped: PUSH_SERVICE_ACCOUNT_KEY not configured")
+        return
 
     tokens = _load_push_tokens()
     if not tokens:
@@ -1084,32 +1134,17 @@ async def _push_to_huawei(title: str, body: str, source: str = "intel"):
     print(f"[PushKit] Starting push with {len(tokens)} tokens")
 
     try:
-        # 1. 获取 OAuth 2.0 Access Token
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            auth_resp = await client.post(
-                "https://oauth-login.cloud.huawei.com/oauth2/v3/token",
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": PUSH_APP_ID,
-                    "client_secret": PUSH_APP_SECRET,
-                }
-            )
-            auth_data = auth_resp.json()
-            access_token = auth_data.get("access_token", "")
-            if not access_token:
-                print(f"[PushKit] Auth failed: {auth_data.get('error_description', 'unknown')}")
-                return
+        # 生成 JWT（带缓存，1小时有效）
+        jwt = _generate_jwt()
 
-        # 2. 逐设备推送
+        # 逐设备推送
         device_tokens = [t["token"] for t in tokens if t.get("token")]
         if not device_tokens:
             return
 
-        # 每条消息最多500个token，分批发送
         batch_size = 500
         for i in range(0, len(device_tokens), batch_size):
             batch = device_tokens[i:i + batch_size]
-            # HarmonyOS 5 Push Kit REST API 格式 (push-type: 0 通知消息)
             message = {
                 "payload": {
                     "notification": {
@@ -1117,7 +1152,7 @@ async def _push_to_huawei(title: str, body: str, source: str = "intel"):
                         "title": title,
                         "body": body,
                         "clickAction": {
-                            "actionType": 0  # 打开应用首页
+                            "actionType": 0
                         },
                         "foregroundShow": True
                     }
@@ -1126,15 +1161,15 @@ async def _push_to_huawei(title: str, body: str, source: str = "intel"):
                     "token": batch
                 },
                 "pushOptions": {
-                    "testMessage": True,  # 测试消息，绕过频控
-                    "ttl": 86400  # 24小时有效期
+                    "testMessage": True,
+                    "ttl": 86400
                 }
             }
             async with httpx.AsyncClient(timeout=10.0) as client:
                 push_resp = await client.post(
-                    f"https://push-api.cloud.huawei.com/v3/{PUSH_APP_ID}/messages:send",
+                    f"https://push-api.cloud.huawei.com/v3/{PUSH_PROJECT_ID}/messages:send",
                     headers={
-                        "Authorization": f"Bearer {access_token}",
+                        "Authorization": f"Bearer {jwt}",
                         "Content-Type": "application/json",
                         "push-type": "0",
                     },
