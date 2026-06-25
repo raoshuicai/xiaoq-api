@@ -1,0 +1,107 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 09d0dc227..a614042e0 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1942,6 +1942,7 @@ class APIServerAdapter(BasePlatformAdapter):
+                 tool_complete_callback=_on_tool_complete,
+                 agent_ref=agent_ref,
+                 gateway_session_key=gateway_session_key,
++                stream_queue=_stream_q,
+             ))
+             # Ensure SSE drain loops can terminate without relying on polling
+             # agent_task.done(), which can race with queue timeout checks.
+@@ -2122,6 +2123,13 @@ class APIServerAdapter(BasePlatformAdapter):
+                     await response.write(
+                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
+                     )
++                elif isinstance(item, dict) and item.get("event") == "approval.request":
++                    # Send approval requests as proper SSE events so clients
++                    # (e.g. xiaoq-api) can detect and forward them to the user.
++                    approval_data = json.dumps(item)
++                    await response.write(
++                        f"event: approval.request\ndata: {approval_data}\n\n".encode()
++                    )
+                 else:
+                     content_chunk = {
+                         "id": completion_id, "object": "chat.completion.chunk",
+@@ -3580,6 +3588,7 @@ class APIServerAdapter(BasePlatformAdapter):
+         tool_complete_callback=None,
+         agent_ref: Optional[list] = None,
+         gateway_session_key: Optional[str] = None,
++        stream_queue=None,
+     ) -> tuple:
+         """
+         Create an agent and run a conversation in a thread executor.
+@@ -3616,6 +3625,37 @@ class APIServerAdapter(BasePlatformAdapter):
+                 if agent_ref is not None:
+                     agent_ref[0] = agent
+                 effective_task_id = session_id or str(uuid.uuid4())
++                _approval_registered = False
++                _approval_token = None
++                approval_key = None
++                # Register approval notify callback if a stream queue is available
++                if stream_queue is not None:
++                    try:
++                        from tools.approval import register_gateway_notify, set_current_session_key, reset_current_session_key
++                        approval_key = gateway_session_key or session_id or str(uuid.uuid4())
++                        _approval_token = set_current_session_key(approval_key)
++                        # Register in run_approval_sessions so /v1/runs/{id}/approval resolves it
++                        self._run_approval_sessions[effective_task_id] = approval_key
++                        # Register run status so the approval handler can find it
++                        self._set_run_status(effective_task_id, "running", last_event="approval.request")
++                        # Use the loop captured outside the thread executor
++                        _cb_loop = loop
++                        def _approval_cb(data):
++                            event = dict(data or {})
++                            event.update({
++                                "event": "approval.request",
++                                "run_id": effective_task_id,
++                                "timestamp": time.time(),
++                                "choices": ["once", "session", "always", "deny"],
++                            })
++                            try:
++                                _cb_loop.call_soon_threadsafe(stream_queue.put_nowait, event)
++                            except Exception:
++                                pass
++                        register_gateway_notify(approval_key, _approval_cb)
++                        _approval_registered = True
++                    except Exception as exc:
++                        print(f"[api_server] Failed to register approval notify: {exc}")
+                 result = agent.run_conversation(
+                     user_message=user_message,
+                     conversation_history=conversation_history,
+@@ -3634,6 +3674,15 @@ class APIServerAdapter(BasePlatformAdapter):
+                     result["session_id"] = _eff_sid
+                 return result, usage
+             finally:
++                if _approval_registered:
++                    try:
++                        from tools.approval import unregister_gateway_notify, reset_current_session_key
++                        unregister_gateway_notify(approval_key)
++                        self._run_approval_sessions.pop(effective_task_id, None)
++                        if _approval_token is not None:
++                            reset_current_session_key(_approval_token)
++                    except Exception:
++                        pass
+                 clear_session_vars(tokens)
+ 
+         return await loop.run_in_executor(None, _run)
+@@ -4088,7 +4137,17 @@ class APIServerAdapter(BasePlatformAdapter):
+             return web.json_response(_openai_error("Invalid JSON"), status=400)
+ 
+         raw_choice = str(body.get("choice", "")).strip().lower()
+-        aliases = {"approve": "once", "approved": "once", "allow": "once"}
++        aliases = {
++            "approve": "once", "approved": "once", "allow": "once",
++            "allow once": "once", "agree": "once",
++            "同意": "once", "同意本次": "once", "允许一次": "once",
++            "session": "session",
++            "同意会话": "session", "本次会话": "session", "本次允许": "session",
++            "always": "always",
++            "总是同意": "always", "始终允许": "always", "总是允许": "always",
++            "deny": "deny", "拒绝": "deny", "denied": "deny",
++            "disallow": "deny", "禁止": "deny", "不同意": "deny",
++        }
+         choice = aliases.get(raw_choice, raw_choice)
+         allowed = {"once", "session", "always", "deny"}
+         if choice not in allowed:

@@ -49,6 +49,11 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 # {session_id: {"seq": int, "tokens": [...], "full_response": str, "status": "processing"|"complete"}}
 active_streams: dict[str, dict] = {}
 
+# ── Approval coordination ────────────────────────────────────────────
+# {run_id: {"event": asyncio.Event, "result": str|None, "session_id": str}}
+_pending_approvals: dict[str, dict] = {}
+_approval_event_loop: asyncio.AbstractEventLoop | None = None
+
 app = FastAPI(title="小Q API", version="1.0.0")
 
 app.add_middleware(
@@ -848,7 +853,24 @@ async def websocket_push(websocket: WebSocket):
                 await websocket.send_json({"type": "pong"})
             # 授权确认回复
             elif data.get("type") == "approve_response":
-                print(f"[WS] 授权回复 from {client_id}: {data}")
+                run_id = data.get("run_id", "")
+                choice = data.get("choice", "deny")
+                print(f"[WS] 授权回复 from {client_id}: run={run_id[:12] if run_id else '?'}, choice={choice}")
+                pending = _pending_approvals.get(run_id)
+                if pending:
+                    pending["result"] = choice
+                    pending["event"].set()
+                else:
+                    # No pending approval — try direct Gateway call anyway
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as ac:
+                            await ac.post(
+                                f"{HERMES_API}/v1/runs/{run_id}/approval",
+                                json={"choice": choice},
+                                headers={"Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else ""},
+                            )
+                    except Exception as e:
+                        print(f"[WS] 直接审批回复失败: {e}")
             # 流式聊天
             elif data.get("type") == "chat":
                 messages = data.get("messages", [])
@@ -976,18 +998,70 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                         buffer += text
                         # SSE events are separated by \n\n
                         while "\n\n" in buffer:
-                            event, buffer = buffer.split("\n\n", 1)
-                            for line in event.strip().split("\n"):
+                            event_block, buffer = buffer.split("\n\n", 1)
+                            event_type = ""  # track event: line if present
+                            data_line = ""
+                            for line in event_block.strip().split("\n"):
                                 line = line.strip()
-                                if line.startswith("data: "):
-                                    raw = line[6:].strip()
-                                    if raw == "[DONE]":
-                                        if client_connected:
-                                            try:
-                                                await websocket.send_json({"type": "chat_done"})
-                                            except Exception:
-                                                client_connected = False
-                                    elif raw:
+                                if line.startswith("event: "):
+                                    event_type = line[7:].strip()
+                                elif line.startswith("data: "):
+                                    data_line = line[6:].strip()
+                            # Handle approval.request events
+                            if event_type == "approval.request" and data_line:
+                                try:
+                                    approval_evt = json.loads(data_line)
+                                    run_id = approval_evt.get("run_id", "")
+                                    if client_connected and run_id:
+                                        # Set up event so WebSocket handler can signal us
+                                        approval_event = asyncio.Event()
+                                        _pending_approvals[run_id] = {
+                                            "event": approval_event,
+                                            "result": None,
+                                            "session_id": session_id,
+                                        }
+                                        # Forward to APP
+                                        await websocket.send_json({
+                                            "type": "approve_request",
+                                            "run_id": run_id,
+                                            "command": approval_evt.get("command", ""),
+                                            "description": approval_evt.get("description", ""),
+                                            "pattern_keys": approval_evt.get("pattern_keys", []),
+                                            "choices": approval_evt.get("choices", ["once", "session", "always", "deny"]),
+                                        })
+                                        print(f"[WS] 审批请求已转发 (run={run_id[:12]}, session={session_id})")
+                                        # Wait for user to respond via WebSocket (up to 5 min)
+                                        try:
+                                            await asyncio.wait_for(approval_event.wait(), timeout=300)
+                                            choice = _pending_approvals[run_id].get("result", "deny")
+                                            # POST choice back to Gateway
+                                            async with httpx.AsyncClient(timeout=10.0) as ac:
+                                                await ac.post(
+                                                    f"{HERMES_API}/v1/runs/{run_id}/approval",
+                                                    json={"choice": choice},
+                                                    headers={
+                                                        "Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else "",
+                                                    },
+                                                )
+                                            print(f"[WS] 审批回复已提交: {choice} (run={run_id[:12]})")
+                                        except asyncio.TimeoutError:
+                                            print(f"[WS] 审批超时 (run={run_id[:12]})")
+                                            # Gateway will timeout on its own
+                                        finally:
+                                            _pending_approvals.pop(run_id, None)
+                                except json.JSONDecodeError:
+                                    pass
+                                continue
+                            # Standard OpenAI chat completion data
+                            if data_line:
+                                raw = data_line
+                                if raw == "[DONE]":
+                                    if client_connected:
+                                        try:
+                                            await websocket.send_json({"type": "chat_done"})
+                                        except Exception:
+                                            client_connected = False
+                                elif raw:
                                         try:
                                             evt = json.loads(raw)
                                             choices = evt.get("choices", [{}])
