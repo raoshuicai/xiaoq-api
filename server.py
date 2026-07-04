@@ -699,16 +699,30 @@ HERMES_API = "http://127.0.0.1:8642"
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy_hermes_v1(request: Request, path: str):
     """代理 /v1/* 到 Hermes API Server"""
+    body_bytes = await request.body()
+    # 拦截 APP 发来的审批回复 POST，同步通知等待中的 _chat_stream_handler
+    if request.method == "POST" and path.startswith("runs/") and path.endswith("/approval"):
+        try:
+            body_data = json.loads(body_bytes) if body_bytes else {}
+            choice = body_data.get("choice", body_data.get("approval", "deny"))
+            run_id = path.split("/")[1]
+            pending = _pending_approvals.get(run_id)
+            if pending:
+                pending["result"] = choice
+                pending["event"].set()
+                print(f"[Proxy] 审批拦截同步: run={run_id[:12]}, choice={choice}")
+        except Exception:
+            pass
+
     async with httpx.AsyncClient(timeout=1800.0) as client:
         url = f"{HERMES_API}/v1/{path}"
         if request.query_params:
             url += f"?{request.query_params}"
         headers = dict(request.headers)
         headers.pop("host", None)
-        body = await request.body()
         resp = await client.request(
             method=request.method, url=url, headers=headers,
-            content=body, follow_redirects=False,
+            content=body_bytes, follow_redirects=False,
         )
         return StreamingResponse(
             resp.aiter_bytes(),
@@ -886,14 +900,23 @@ async def websocket_push(websocket: WebSocket):
                         # 优先检查活跃流（仍在处理中或刚完成的断点续传）
                         stream = active_streams.get(session_id)
                         if stream and stream["tokens"]:
+                            # 使用服务端记录的已同步序列号防止重复推送（sync retry 会带相同的 last_seq）
+                            stream.setdefault("last_synced_seq", -1)
+                            effective_seq = max(last_seq, stream["last_synced_seq"])
                             # 发送所有错过的 token（含离线期间生成的）
-                            missed = [t for t in stream["tokens"] if t["seq"] > last_seq]
+                            missed = [t for t in stream["tokens"] if t["seq"] > effective_seq]
                             for t in missed:
                                 await websocket.send_json({
                                     "type": "chat_token",
                                     "seq": t["seq"],
                                     "content": t["content"],
                                 })
+                            # 更新已同步序列号，防止后续 sync retry 重复推送
+                            if missed:
+                                stream["last_synced_seq"] = max(
+                                    stream["last_synced_seq"],
+                                    max(t["seq"] for t in missed)
+                                )
                             
                             if stream["status"] == "processing":
                                 # 仍在处理中 → 通知客户端继续等待实时流
@@ -978,7 +1001,6 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                         "Content-Type": "application/json",
                         "Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else "",
                         "X-Hermes-Session-Id": session_id,
-                        "X-Hermes-Skip-Approval": "true",
                     },
                 ) as resp:
                     if resp.status_code != 200:
@@ -1013,7 +1035,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                     approval_evt = json.loads(data_line)
                                     run_id = approval_evt.get("run_id", "")
                                     if client_connected and run_id:
-                                        # Set up event so WebSocket handler can signal us
+                                        # Set up event so proxy/WebSocket handler can signal us
                                         approval_event = asyncio.Event()
                                         _pending_approvals[run_id] = {
                                             "event": approval_event,
@@ -1030,27 +1052,38 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             "choices": approval_evt.get("choices", ["once", "session", "always", "deny"]),
                                         })
                                         print(f"[WS] 审批请求已转发 (run={run_id[:12]}, session={session_id})")
-                                        # Wait for user to respond via WebSocket (up to 5 min)
-                                        try:
-                                            await asyncio.wait_for(approval_event.wait(), timeout=300)
-                                            choice = _pending_approvals[run_id].get("result", "deny")
-                                            # POST choice back to Gateway
-                                            async with httpx.AsyncClient(timeout=10.0) as ac:
-                                                await ac.post(
-                                                    f"{HERMES_API}/v1/runs/{run_id}/approval",
-                                                    json={"choice": choice},
-                                                    headers={
-                                                        "Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else "",
-                                                    },
-                                                )
-                                            print(f"[WS] 审批回复已提交: {choice} (run={run_id[:12]})")
-                                        except asyncio.TimeoutError:
-                                            print(f"[WS] 审批超时 (run={run_id[:12]})")
-                                            # Gateway will timeout on its own
-                                        finally:
-                                            _pending_approvals.pop(run_id, None)
+                                        # Wait for approval resolution (proxy intercept or WebSocket).
+                                        # Poll result flag instead of blocking on asyncio.Event to
+                                        # avoid inter-task wakeup races on busy event loops.
+                                        _wait_start = time.monotonic()
+                                        _approval_done = False
+                                        while time.monotonic() - _wait_start < 300:
+                                            pending = _pending_approvals.get(run_id)
+                                            if pending and pending["result"] is not None:
+                                                _approval_done = True
+                                                choice = pending["result"]
+                                                break
+                                            await asyncio.sleep(2.0)
+                                        if _approval_done:
+                                            # POST choice back to Gateway (idempotent — Gateway handles duplicate)
+                                            try:
+                                                async with httpx.AsyncClient(timeout=10.0) as ac:
+                                                    await ac.post(
+                                                        f"{HERMES_API}/v1/runs/{run_id}/approval",
+                                                        json={"choice": choice},
+                                                        headers={
+                                                            "Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else "",
+                                                        },
+                                                    )
+                                                print(f"[WS] 审批回复已提交: {choice} (run={run_id[:12]})")
+                                            except Exception as e:
+                                                print(f"[WS] 审批回复提交失败: {e} (run={run_id[:12]})")
+                                        else:
+                                            print(f"[WS] 审批等待超时 (run={run_id[:12]})")
                                 except json.JSONDecodeError:
                                     pass
+                                finally:
+                                    _pending_approvals.pop(run_id, None)
                                 continue
                             # Standard OpenAI chat completion data
                             if data_line:

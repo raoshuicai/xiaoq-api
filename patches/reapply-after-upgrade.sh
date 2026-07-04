@@ -1,19 +1,21 @@
 #!/bin/bash
 # ============================================================================
-# 小Q APPROVAL CHANNEL PATCH — 升级后一键恢复
+# 小Q 审批通道补丁 — v0.18.0+ 一键恢复
 # ============================================================================
-# 用途：Hermes Agent 升级后，重新应用 Gateway 审批通道补丁
+# 用途：Hermes Agent v0.18.0+ 升级后，重新应用 Gateway 审批通道补丁。
+#       v0.18.0 已原生支持审批通道（/v1/runs + /v1/runs/{run_id}/events），
+#       但 /v1/chat/completions SSE 流不转发 approval.request 事件。
+#       本补丁桥接审批事件到 chat-completions SSE 流，供给 xiaoq-api 拦截。
 # 用法：bash patches/reapply-after-upgrade.sh
-# 原理：读取 patches/gateway-approval-channel.patch → 应用到 Hermes 源码
+# 原理：git apply patches/gateway-approval-channel.patch → 重启 Gateway
 # ============================================================================
 
 set -e
 
 PATCH_FILE="$(dirname "$0")/gateway-approval-channel.patch"
 HERMES_SRC="$HOME/.hermes/hermes-agent"
-API_SRC="$HOME/workspace/xiaoq-api"
 
-echo "=== 小Q 审批通道补丁恢复 ==="
+echo "=== 小Q 审批通道补丁恢复 (v0.18.0+) ==="
 echo ""
 
 # 检查补丁文件
@@ -40,7 +42,7 @@ if git apply --check "$PATCH_FILE" 2>/dev/null; then
     git apply "$PATCH_FILE"
     echo "✅ Gateway 补丁已应用"
 else
-    echo "⚠️ 补丁无法直接应用（代码版本可能已变），尝试手动合并..."
+    echo "⚠️  补丁无法直接应用（代码版本可能已变），尝试手动合并..."
     echo "   请检查 $HERMES_SRC/gateway/platforms/api_server.py"
     echo "   参考补丁内容手动修改："
     echo "   cat $PATCH_FILE"
