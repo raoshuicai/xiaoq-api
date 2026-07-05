@@ -956,11 +956,19 @@ async def websocket_push(websocket: WebSocket):
                                 db.commit()
                                 print(f"[Offline] Synced and deleted cached response for {session_id}")
                             else:
-                                # 回退2：查不到精确 session_id 时，取最近一条缓存回复兜底
-                                # （APP 重启后 client_id 变更时，仍能返回最近回复替换 ⏳ 占位符）
-                                fallback = db.execute(
-                                    "SELECT session_id, content FROM offline_chats ORDER BY updated_at DESC LIMIT 1"
-                                ).fetchone()
+                                # 回退2：按 device_id 前缀匹配（APP 固定 device_id，重启后不变）
+                                device_prefix = session_id.split('-')[0] + '-%' if '-' in session_id else None
+                                fallback = None
+                                if device_prefix:
+                                    fallback = db.execute(
+                                        "SELECT session_id, content FROM offline_chats WHERE session_id LIKE ? ORDER BY updated_at DESC LIMIT 1",
+                                        (device_prefix,)
+                                    ).fetchone()
+                                if not fallback:
+                                    # 回退3：全局最近一条缓存回复（兜底）
+                                    fallback = db.execute(
+                                        "SELECT session_id, content FROM offline_chats ORDER BY updated_at DESC LIMIT 1"
+                                    ).fetchone()
                                 if fallback:
                                     content = fallback[1]
                                     await websocket.send_json({
@@ -970,7 +978,8 @@ async def websocket_push(websocket: WebSocket):
                                     })
                                     db.execute("DELETE FROM offline_chats WHERE session_id = ?", (fallback[0],))
                                     db.commit()
-                                    print(f"[Offline] Fallback: returned most recent cached response for {session_id}")
+                                    match_type = "device" if device_prefix else "global"
+                                    print(f"[Offline] {match_type} fallback: returned cached response for {session_id}")
                                 else:
                                     await websocket.send_json({
                                         "type": "sync_pending_response",
@@ -1031,7 +1040,19 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                         return
 
                     buffer = ""
-                    async for chunk in resp.aiter_bytes():
+                    last_token_time = time.monotonic()
+                    SSE_IDLE_TIMEOUT = 45  # 45秒无SSE数据则判定断流
+                    ait = resp.aiter_bytes().__aiter__()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(ait.__anext__(), timeout=SSE_IDLE_TIMEOUT)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            print(f"[WS] SSE idle timeout ({SSE_IDLE_TIMEOUT}s) for {session_id}, caching current response")
+                            client_connected = False
+                            break
+                        last_token_time = time.monotonic()
                         text = chunk.decode() if isinstance(chunk, bytes) else str(chunk)
                         buffer += text
                         # SSE events are separated by \n\n
@@ -1156,6 +1177,14 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                     db.commit()
                     db.close()
                     print(f"[Offline] Successfully cached response for {session_id} ({len(full_response)} chars)")
+                    # Batch 2: WS 断线时通过 Push Kit 通知 APP 有新回复
+                    try:
+                        title = f"💬 小Q回复"
+                        preview = full_response[:80].replace('\n', ' ').strip()
+                        await _push_to_huawei(title, preview + '...', "chat")
+                        print(f"[PushKit] Notified via push for {session_id}")
+                    except Exception as push_e:
+                        print(f"[PushKit] WS-disconnect push notify failed: {push_e}")
                 except Exception as cache_err:
                     print(f"[Offline] Failed to cache response: {cache_err}")
         else:
