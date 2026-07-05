@@ -956,11 +956,27 @@ async def websocket_push(websocket: WebSocket):
                                 db.commit()
                                 print(f"[Offline] Synced and deleted cached response for {session_id}")
                             else:
-                                await websocket.send_json({
-                                    "type": "sync_pending_response",
-                                    "session_id": session_id,
-                                    "content": "",
-                                })
+                                # 回退2：查不到精确 session_id 时，取最近一条缓存回复兜底
+                                # （APP 重启后 client_id 变更时，仍能返回最近回复替换 ⏳ 占位符）
+                                fallback = db.execute(
+                                    "SELECT session_id, content FROM offline_chats ORDER BY updated_at DESC LIMIT 1"
+                                ).fetchone()
+                                if fallback:
+                                    content = fallback[1]
+                                    await websocket.send_json({
+                                        "type": "sync_pending_response",
+                                        "session_id": session_id,
+                                        "content": content,
+                                    })
+                                    db.execute("DELETE FROM offline_chats WHERE session_id = ?", (fallback[0],))
+                                    db.commit()
+                                    print(f"[Offline] Fallback: returned most recent cached response for {session_id}")
+                                else:
+                                    await websocket.send_json({
+                                        "type": "sync_pending_response",
+                                        "session_id": session_id,
+                                        "content": "",
+                                    })
                             db.close()
                     except Exception as sync_err:
                         print(f"[Offline] Sync pending error: {sync_err}")
