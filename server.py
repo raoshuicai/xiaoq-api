@@ -22,6 +22,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 # ── Config ──────────────────────────────────────────────────────────
+# ── Proxy Config ──────────────────────────────────────────────────────
+# 出站代理：用于访问外部 API（OpenRouter、华为 Push Kit 等）
+# 入站请求不受影响（FastAPI 本身不使用这些变量）
+PROXIES = {
+    "http://": "http://127.0.0.1:7897",
+    "https://": "http://127.0.0.1:7897",
+}
 # Load .env for OpenRouter credentials
 _ENV_FILE = Path(os.path.expanduser("~/.hermes/.env"))
 if _ENV_FILE.exists():
@@ -668,7 +675,7 @@ async def chat_direct(request: Request):
     threading.Thread(target=archive_to_hermes, daemon=True).start()
     
     # ── Fast path: stream from OpenRouter directly ──
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=120.0, proxies=PROXIES) as client:
         resp = await client.request(
             method="POST",
             url=f"{OPENROUTER_URL}/chat/completions",
@@ -1373,7 +1380,7 @@ async def _push_to_huawei(title: str, body: str, source: str = "intel"):
                     "ttl": 86400
                 }
             }
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=10.0, proxies=PROXIES) as client:
                 push_resp = await client.post(
                     f"https://push-api.cloud.huawei.com/v3/{PUSH_PROJECT_ID}/messages:send",
                     headers={
