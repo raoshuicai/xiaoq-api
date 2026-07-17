@@ -1,0 +1,30 @@
+[Unit]
+Description=小Q API 伴侣服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/xiaoq/workspace/xiaoq-api
+ExecStart=/home/xiaoq/.hermes/hermes-agent/venv/bin/python3 -m uvicorn server:app --host 0.0.0.0 --port 8866
+Restart=always
+RestartSec=5
+
+# Push Kit
+Environment="PUSH_PROJECT_ID=101653523864334050"
+Environment="PUSH_SERVICE_ACCOUNT_KEY=/mnt/d/05_HarmonyNext/XiaoQ/101653523864334050118035699private.json"
+
+# API key for Hermes Gateway auth
+Environment="API_SERVER_KEY=4H3HiSYI7SMY4AfAj69isp1FSCNxWO5n"
+
+# Proxy — UnsetEnvironment first to clear bash-inherited proxy, then set precisely
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY
+Environment="HTTP_PROXY=http://172.27.96.1:7897"
+Environment="HTTPS_PROXY=http://172.27.96.1:7897"
+Environment="NO_PROXY=127.0.0.1,localhost,::1"
+
+# Load API keys from .env (DEEPSEEK_API_KEY etc.)
+EnvironmentFile=-/home/xiaoq/.hermes/.env
+
+[Install]
+WantedBy=default.target
