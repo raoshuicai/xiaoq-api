@@ -30,3 +30,38 @@ Rules:
 Not lazy about: understanding the problem (read it fully and trace the real flow before picking a rung, a small diff you don't understand is just laziness dressed up as efficiency), input validation at trust boundaries, error handling that prevents data loss, security, accessibility, the calibration real hardware needs (the platform is never the spec ideal, a clock drifts, a sensor reads off), anything explicitly requested. Lazy code without its check is unfinished: non-trivial logic leaves ONE runnable check behind, the smallest thing that fails if the logic breaks (an assert-based demo/self-check or one small test file; no frameworks, no fixtures). Trivial one-liners need no test.
 
 (Yes, this file also applies to agents working on the ponytail repo itself. Especially to them.)
+
+---
+
+## Task Contract & Pause Policy
+
+Nontrivial work is described as a task contract — what the work is for, what action is requested, how the result should be delivered, what boundaries must be preserved, and when the agent should pause. This is not a role prompt; it's clear boundaries and acceptance criteria.
+
+Template:
+
+```text
+Context:
+I am working on [larger task].
+The target audience/user is [who].
+This result should help them [achieve what outcome].
+
+Request:
+Please complete [one clear action].
+
+Output format:
+Return the result as [specific structure].
+It must include [required sections].
+Keep it within [length or scope].
+
+Constraints:
+Do not [bad assumption].
+Do not [out-of-scope content].
+If information is missing, mark uncertainty explicitly.
+
+Pause policy:
+Unless the next step involves an irreversible or externally visible operation,
+a scope change, or information only I can provide, keep working and report
+back after the task is complete.
+```
+
+Pause policy is the key part: the agent should NOT stop and ask after every step. It keeps working through implementation and verification, and only pauses when the next step is irreversible, changes scope, or needs input only the user has. This is separate from tool approval — file writes, shell commands, publishing, and credentials still follow the configured approval policy.
