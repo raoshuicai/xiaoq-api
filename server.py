@@ -550,6 +550,144 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
     return {"status": "ok", "message": message}
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Cron 任务面板 API（S10a）
+#
+#  直接复用 Hermes 自己的 cron.jobs / cron.scheduler：
+#    - 锁与原子写由 cron.jobs 内部处理，不需要在这里重造并发保护
+#    - 不走 `hermes cron edit`（那条路会把 next_run_at 往后推一整个周期）
+#    - 手动执行与 scheduler tick 共用 run_one_job 路径，行为一致
+# ══════════════════════════════════════════════════════════════════════
+
+def _cron_jobs_module():
+    """延迟导入 Hermes 的 cron.jobs（进程启动时就 import 会拖慢并可能受 PATH 影响）"""
+    import sys as _sys
+    hh = str(Path(os.path.expanduser("~/.hermes/hermes-agent")))
+    if hh not in _sys.path:
+        _sys.path.insert(0, hh)
+    import cron.jobs as _jobs
+    return _jobs
+
+
+def _cron_scheduler_module():
+    import sys as _sys
+    hh = str(Path(os.path.expanduser("~/.hermes/hermes-agent")))
+    if hh not in _sys.path:
+        _sys.path.insert(0, hh)
+    import cron.scheduler as _sched
+    return _sched
+
+
+def _cron_job_view(job: dict) -> dict:
+    """把内部 job 记录裁剪成 APP 需要的字段（不暴露 prompt/密钥等）"""
+    sched = job.get("schedule") or {}
+    display = job.get("schedule_display") or sched.get("display") or sched.get("expr") or "?"
+    return {
+        "id": job.get("id"),
+        "name": job.get("name") or "",
+        "schedule": display,
+        "enabled": bool(job.get("enabled", True)),
+        "state": job.get("state") or ("scheduled" if job.get("enabled", True) else "paused"),
+        "next_run_at": job.get("next_run_at"),
+        "last_run_at": job.get("last_run_at"),
+        "last_status": job.get("last_status"),
+        "last_error": job.get("last_error"),
+        "deliver": job.get("deliver") or "local",
+        "no_agent": bool(job.get("no_agent")),
+        "script": job.get("script") or "",
+    }
+
+
+@app.get("/api/cron/jobs")
+def cron_list_jobs(request: Request):
+    """列出全部定时任务（含已暂停的）"""
+    check_auth(request)
+    try:
+        jobs_mod = _cron_jobs_module()
+        raw = jobs_mod.list_jobs(include_disabled=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron read error: {e}")
+
+    items = [_cron_job_view(j) for j in raw]
+    # 按下次执行时间排序（None 排最后）
+    items.sort(key=lambda x: x.get("next_run_at") or "9999")
+    return {"items": items, "total": len(items), "has_more": False}
+
+
+@app.post("/api/cron/jobs/{job_id}/toggle")
+async def cron_toggle_job(job_id: str, request: Request):
+    """启用/暂停任务。幂等：重复设同值返回当前状态，不报错。"""
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if "enabled" not in body:
+        raise HTTPException(status_code=400, detail="Field 'enabled' is required")
+    target = bool(body.get("enabled"))
+
+    try:
+        jobs_mod = _cron_jobs_module()
+        job = jobs_mod.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+
+        # 幂等：已是目标状态就直接返回，不做写操作
+        if bool(job.get("enabled", True)) == target:
+            return {"id": job_id, "enabled": target, "changed": False}
+
+        updated = jobs_mod.resume_job(job_id) if target else jobs_mod.pause_job(job_id)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+        return {
+            "id": job_id,
+            "enabled": bool(updated.get("enabled", target)),
+            "changed": True,
+            "next_run_at": updated.get("next_run_at"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron toggle error: {e}")
+
+
+@app.post("/api/cron/jobs/{job_id}/run")
+def cron_run_job(job_id: str, request: Request):
+    """立即执行一次。任务已在跑 -> 409 JOB_ALREADY_RUNNING。"""
+    check_auth(request)
+    try:
+        jobs_mod = _cron_jobs_module()
+        job = jobs_mod.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+
+        # ⚠️ 先单独判「暂停」：claim_job_for_fire 对 disabled/paused 的 job
+        #    同样返回 False（cron/jobs.py 内部会先拒），若不区分就会把
+        #    「已暂停」误报成「正在运行」。两者是完全不同的用户处境。
+        if not job.get("enabled", True) or job.get("state") == "paused":
+            raise HTTPException(status_code=409, detail="JOB_PAUSED")
+
+        # at-most-once：抢不到 claim 说明 scheduler（或另一次手动触发）正在跑它
+        if not jobs_mod.claim_job_for_fire(job_id):
+            raise HTTPException(status_code=409, detail="JOB_ALREADY_RUNNING")
+
+        sched = _cron_scheduler_module()
+        # 执行可能很久（跑脚本/起 agent），丢后台线程，接口立刻返回
+        def _fire():
+            try:
+                sched.run_one_job(job)
+            except Exception as _e:
+                print(f"[Cron] manual run failed for {job_id}: {_e}", flush=True)
+
+        threading.Thread(target=_fire, daemon=True).start()
+        return {"status": "triggered", "run_id": job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron run error: {e}")
+
+
 @app.post("/api/test-approval")
 async def test_approval(request: Request):
     """测试授权卡片：向所有WebSocket客户端发送approve_request"""
