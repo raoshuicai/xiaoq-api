@@ -12,6 +12,8 @@ import json
 import os
 import re
 import uuid
+import shutil
+import io
 import sqlite3
 import threading
 import time
@@ -995,6 +997,195 @@ def session_messages(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Session messages error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  模型 / 技能 / 记忆（S13a）
+# ══════════════════════════════════════════════════════════════════════
+
+HERMES_CONFIG = Path(os.path.expanduser("~/.hermes/config.yaml"))
+HERMES_SKILLS_DIR = Path(os.path.expanduser("~/.hermes/skills"))
+HERMES_MEMORY = Path(os.path.expanduser("~/.hermes/memories/MEMORY.md"))
+
+
+def _load_hermes_config():
+    try:
+        import yaml
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YAML_UNAVAILABLE: {e}")
+    if not HERMES_CONFIG.exists():
+        raise HTTPException(status_code=500, detail="CONFIG_MISSING")
+    try:
+        return yaml.safe_load(io.open(HERMES_CONFIG, encoding="utf-8")) or {}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CONFIG_PARSE_ERROR: {e}")
+
+
+def _collect_models(cfg: dict) -> list:
+    """从配置里汇总"这套配置真实用到过"的模型，去重后返回"""
+    cur_model = ((cfg.get("model") or {}).get("default")) or ""
+    cur_provider = ((cfg.get("model") or {}).get("provider")) or ""
+    seen = {}
+    order = []
+
+    def add(mid, prov, is_cur=False):
+        if not mid or not isinstance(mid, str):
+            return
+        key = "%s|%s" % (prov or "", mid)
+        if key in seen:
+            if is_cur:
+                seen[key]["current"] = True
+            return
+        seen[key] = {"id": mid, "name": mid, "provider": prov or "", "current": is_cur}
+        order.append(key)
+
+    add(cur_model, cur_provider, True)
+
+    moa = cfg.get("moa") or {}
+    for m in (moa.get("reference_models") or []):
+        if isinstance(m, dict):
+            add(m.get("model"), m.get("provider"))
+    agg = moa.get("aggregator") or {}
+    if isinstance(agg, dict):
+        add(agg.get("model"), agg.get("provider"))
+    presets = moa.get("presets") or {}
+    if isinstance(presets, dict):
+        for _, pv in presets.items():
+            if not isinstance(pv, dict):
+                continue
+            for m in (pv.get("reference_models") or []):
+                if isinstance(m, dict):
+                    add(m.get("model"), m.get("provider"))
+            a = pv.get("aggregator") or {}
+            if isinstance(a, dict):
+                add(a.get("model"), a.get("provider"))
+
+    aux = cfg.get("auxiliary") or {}
+    if isinstance(aux, dict):
+        for _, av in aux.items():
+            if isinstance(av, dict) and av.get("provider") not in (None, "auto"):
+                add(av.get("model"), av.get("provider"))
+
+    return [seen[k] for k in order]
+
+
+@app.get("/api/models")
+def list_models(request: Request):
+    """可用模型（当前配置里出现过的那批）+ current 标记"""
+    check_auth(request)
+    cfg = _load_hermes_config()
+    items = _collect_models(cfg)
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/api/models/switch")
+async def switch_model(request: Request):
+    """切换默认模型（改 config.yaml 的 model.default）。
+
+    ⚠️ 生效时机 = **下一次对话**（不动正在进行的流）。
+    ⚠️ 只改 model.default 一个字段；写前备份、原子替换。
+    """
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    mid = str(body.get("id") or "").strip()
+    if not mid:
+        raise HTTPException(status_code=400, detail="MODEL_ID_REQUIRED")
+
+    cfg = _load_hermes_config()
+    allowed = {m["id"] for m in _collect_models(cfg)}
+    if mid not in allowed:
+        # 不在配置已知集合里 —— 不直接拒绝（用户可能想用新模型），但要显式确认
+        if body.get("force") is not True:
+            raise HTTPException(status_code=404, detail="MODEL_NOT_FOUND")
+
+    try:
+        import yaml
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YAML_UNAVAILABLE: {e}")
+
+    # 备份
+    try:
+        shutil.copy(str(HERMES_CONFIG), str(HERMES_CONFIG) + ".bak-modelswitch")
+    except Exception:
+        pass
+
+    try:
+        cfg.setdefault("model", {})
+        old = cfg["model"].get("default")
+        cfg["model"]["default"] = mid
+
+        tmp = str(HERMES_CONFIG) + ".tmp"
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        os.replace(tmp, str(HERMES_CONFIG))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MODEL_SWITCH_WRITE_FAILED: {e}")
+
+    print(f"[Models] default model: {old} -> {mid}", flush=True)
+    return {
+        "id": mid,
+        "applied_at": datetime.now(TZ).isoformat(),
+        "previous": old,
+        "note": "下一次对话生效",
+    }
+
+
+@app.get("/api/skills")
+def list_skills(request: Request, q: str = Query("")):
+    """技能列表（只读）。从各分类目录下的 SKILL.md 抽取 frontmatter。"""
+    check_auth(request)
+    items = []
+    if HERMES_SKILLS_DIR.is_dir():
+        for cat in sorted(HERMES_SKILLS_DIR.iterdir()):
+            # 跳过隐藏/归档目录（如 .archive / .cache）—— 它们不是可用的技能分类
+            if not cat.is_dir() or cat.name.startswith("."):
+                continue
+            for sk in sorted(cat.iterdir()):
+                if sk.name.startswith("."):
+                    continue
+                f = sk / "SKILL.md"
+                if not f.is_file():
+                    continue
+                name, desc = sk.name, ""
+                try:
+                    head = f.read_text(encoding="utf-8", errors="replace")[:2000]
+                    if head.startswith("---"):
+                        end = head.find("\n---", 3)
+                        fm = head[3:end] if end > 0 else head[3:]
+                        for line in fm.splitlines():
+                            if line.startswith("name:"):
+                                name = line.split(":", 1)[1].strip().strip('"\'')
+                            elif line.startswith("description:"):
+                                desc = line.split(":", 1)[1].strip().strip('"\'')
+                except Exception:
+                    pass
+                if q and q.lower() not in name.lower() and q.lower() not in desc.lower():
+                    continue
+                items.append({"name": name, "description": desc, "category": cat.name})
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/api/memory")
+def get_memory(request: Request):
+    """Agent 记忆文件内容（只读）"""
+    check_auth(request)
+    if not HERMES_MEMORY.exists():
+        return {"content": "", "exists": False}
+    try:
+        txt = HERMES_MEMORY.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MEMORY_READ_ERROR: {e}")
+    info = HERMES_MEMORY.stat()
+    return {
+        "content": txt,
+        "exists": True,
+        "size": info.st_size,
+        "updated_at": int(info.st_mtime),
+    }
 
 
 @app.post("/api/test-approval")
