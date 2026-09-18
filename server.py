@@ -872,10 +872,17 @@ async def cron_job_update(job_id: str, request: Request):
 @app.post("/api/test-approval")
 async def test_approval(request: Request):
     """测试授权卡片：向所有WebSocket客户端发送approve_request"""
+    # S11：测试消息也带上触发上下文 + 一条超长命令，便于验证
+    # 「上下文展示」「长命令滚动」「始终允许二次确认」三项增强
+    _long_cmd = "rm -rf /data/production/db && " + " && ".join(
+        ["cp -r /etc/nginx/conf.d/%d /backup/nginx_%d" % (i, i) for i in range(1, 21)]
+    )
     await manager.broadcast({
         "type": "approve_request",
         "run_id": "test-run-001",
-        "command": "rm -rf /data/production/db",
+        "command": _long_cmd,
+        "description": "执行数据库清理脚本时触发安全扫描（测试消息）",
+        "session_id": "device-test-session-s11",
         "pattern_keys": ["tirith:destructive_command"],
         "choices": ["once", "session", "always", "deny"]
     })
@@ -1545,9 +1552,12 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             "type": "approve_request",
                                             "run_id": run_id,
                                             "command": approval_evt.get("command", ""),
+                                            # description：Gateway 给的触发上下文说明（S11 起 APP 会显示）
                                             "description": approval_evt.get("description", ""),
                                             "pattern_keys": approval_evt.get("pattern_keys", []),
                                             "choices": approval_evt.get("choices", ["once", "session", "always", "deny"]),
+                                            # session_id：哪个会话触发的（S11 新增，便于 APP 显示上下文）
+                                            "session_id": session_id,
                                         })
                                         print(f"[WS] 审批请求已转发 (run={run_id[:12]}, session={session_id})")
                                         # Wait for approval resolution (proxy intercept or WebSocket).
