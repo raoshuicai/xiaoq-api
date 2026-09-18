@@ -10,6 +10,7 @@
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -686,6 +687,175 @@ def cron_run_job(job_id: str, request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cron run error: {e}")
+
+
+# ── Cron 详情 / 历史 / 编辑 ──────────────────────────────────────────
+
+# 输出文件名白名单（防路径穿越）
+_OUTPUT_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}$")
+
+
+def _cron_output_dir(job_id: str) -> Path:
+    return Path(os.path.expanduser("~/.hermes/cron/output")) / job_id
+
+
+@app.get("/api/cron/jobs/{job_id}")
+def cron_job_detail(job_id: str, request: Request):
+    """单个任务详情。含 prompt 全文（用户自己的数据）与完整 last_error。"""
+    check_auth(request)
+    try:
+        jobs_mod = _cron_jobs_module()
+        job = jobs_mod.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+
+        view = _cron_job_view(job)
+        sched = job.get("schedule") or {}
+        repeat = job.get("repeat") or {}
+
+        # 详情页才给的字段
+        view["prompt"] = job.get("prompt") or ""
+        view["schedule_kind"] = sched.get("kind") or ""
+        view["schedule_expr"] = sched.get("expr") or ""
+        view["repeat_times"] = repeat.get("times")
+        view["repeat_completed"] = repeat.get("completed")
+        view["created_at"] = job.get("created_at")
+        view["paused_at"] = job.get("paused_at")
+        view["paused_reason"] = job.get("paused_reason")
+        view["model"] = job.get("model")
+        view["provider"] = job.get("provider")
+        view["workdir"] = job.get("workdir")
+        view["skills"] = job.get("skills") or []
+        # 输出目录里有多少次历史
+        out_dir = _cron_output_dir(job_id)
+        runs = 0
+        if out_dir.is_dir():
+            try:
+                runs = len([f for f in out_dir.iterdir() if f.is_file()])
+            except Exception:
+                runs = 0
+        view["run_history_count"] = runs
+        return view
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron detail error: {e}")
+
+
+@app.get("/api/cron/jobs/{job_id}/outputs")
+def cron_job_outputs(job_id: str, request: Request):
+    """该任务的运行输出列表（新→旧）"""
+    check_auth(request)
+    try:
+        jobs_mod = _cron_jobs_module()
+        if jobs_mod.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+
+        out_dir = _cron_output_dir(job_id)
+        items = []
+        if out_dir.is_dir():
+            for f in out_dir.iterdir():
+                if not f.is_file() or not _OUTPUT_NAME_RE.match(f.name):
+                    continue
+                try:
+                    st = f.stat()
+                except Exception:
+                    continue
+                items.append({
+                    "name": f.name,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                })
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"items": items[:50], "total": len(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron outputs error: {e}")
+
+
+@app.get("/api/cron/jobs/{job_id}/outputs/{name}")
+def cron_job_output_content(job_id: str, name: str, request: Request):
+    """单次运行的输出内容（纯文本，最多返回 200KB）"""
+    check_auth(request)
+    # 双重防护：名字白名单 + 解析后仍在目标目录内
+    if not _OUTPUT_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="INVALID_OUTPUT_NAME")
+    try:
+        jobs_mod = _cron_jobs_module()
+        if jobs_mod.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+
+        out_dir = _cron_output_dir(job_id).resolve()
+        target = (out_dir / name).resolve()
+        if out_dir not in target.parents:
+            raise HTTPException(status_code=400, detail="INVALID_OUTPUT_NAME")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="OUTPUT_NOT_FOUND")
+
+        data = target.read_bytes()[:200000]
+        text = data.decode("utf-8", errors="replace")
+        return {"name": name, "content": text, "truncated": len(data) >= 200000}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron output read error: {e}")
+
+
+@app.post("/api/cron/jobs/{job_id}/update")
+async def cron_job_update(job_id: str, request: Request):
+    """编辑任务的 name / schedule。
+
+    ⚠️ 只放开这两个字段：
+      - id 由 update_job 的 IMMUTABLE 保护挡住（它是 output 目录名，改了会出事）
+      - prompt / script / no_agent 不在白名单内 —— 这些改动的影响面大，
+        继续在 Hermes 侧用 CLI 改更稳妥
+    schedule 变更后 next_run_at 由 update_job 自动重算。
+    """
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    updates = {}
+    if "name" in body:
+        nm = str(body.get("name") or "").strip()
+        if not nm:
+            raise HTTPException(status_code=400, detail="NAME_EMPTY")
+        if len(nm) > 120:
+            raise HTTPException(status_code=400, detail="NAME_TOO_LONG")
+        updates["name"] = nm
+
+    if "schedule" in body:
+        expr = str(body.get("schedule") or "").strip()
+        if not expr:
+            raise HTTPException(status_code=400, detail="SCHEDULE_EMPTY")
+        try:
+            jobs_mod_probe = _cron_jobs_module()
+            jobs_mod_probe.parse_schedule(expr)   # 非法表达式会抛
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"INVALID_SCHEDULE: {e}")
+        updates["schedule"] = expr
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="NOTHING_TO_UPDATE")
+
+    try:
+        jobs_mod = _cron_jobs_module()
+        if jobs_mod.get_job(job_id) is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+        updated = jobs_mod.update_job(job_id, updates)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="JOB_NOT_FOUND")
+        view = _cron_job_view(updated)
+        view["prompt"] = updated.get("prompt") or ""
+        view["schedule_expr"] = (updated.get("schedule") or {}).get("expr") or ""
+        return view
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cron update error: {e}")
 
 
 @app.post("/api/test-approval")
