@@ -347,7 +347,7 @@ def tokens_summary(request: Request):
 
         this_month = db.execute("""
             SELECT COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp, COUNT(*) as cnt
-            FROM sessions WHERE strftime('%%Y-%%m', started_at, 'unixepoch', '+8 hours') = ?
+            FROM sessions WHERE strftime('%Y-%m', started_at, 'unixepoch', '+8 hours') = ?
         """, [this_month_str]).fetchone()
 
         total = db.execute("""
@@ -357,7 +357,7 @@ def tokens_summary(request: Request):
 
         active_days = db.execute("""
             SELECT COUNT(DISTINCT date(started_at, 'unixepoch', '+8 hours')) as d
-            FROM sessions WHERE strftime('%%Y-%%m', started_at, 'unixepoch', '+8 hours') = ?
+            FROM sessions WHERE strftime('%Y-%m', started_at, 'unixepoch', '+8 hours') = ?
         """, [this_month_str]).fetchone()["d"] or 1
 
         models = db.execute("""
