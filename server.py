@@ -540,6 +540,37 @@ async def test_approval(request: Request):
     return {"status": "ok", "message": "approve_request broadcast sent"}
 
 
+@app.post("/api/test-disconnect")
+async def test_disconnect(data: dict):
+    """测试用：强制断开指定客户端的 WebSocket（服务端进程不受影响）
+
+    body: {"client_id": "device-xxx"}  留空则断开全部
+    """
+    target = data.get("client_id", "")
+    if target:
+        async with manager.lock:
+            ws = manager.active_connections.pop(target, None)
+        if ws is None:
+            return {"ok": False, "error": "client not connected",
+                    "connected": list(manager.active_connections.keys())}
+        try:
+            await ws.close(code=1011, reason="test-disconnect")
+        except Exception:
+            pass
+        return {"ok": True, "disconnected": target}
+
+    async with manager.lock:
+        items = list(manager.active_connections.items())
+        manager.active_connections.clear()
+    for cid, ws in items:
+        try:
+            await ws.close(code=1011, reason="test-disconnect")
+        except Exception:
+            pass
+    return {"ok": True, "disconnected": [cid for cid, _ in items]}
+
+
+
 @app.get("/api/push/messages")
 def list_messages(
     request: Request,
@@ -868,7 +899,13 @@ async def websocket_push(websocket: WebSocket):
             print(f"[WS] Auto-push error: {e}")
         # 保持连接，等待消息
         while True:
+            _t_recv = time.time()
             data = await websocket.receive_json()
+            print(f"[WS-DIAG] recv from {client_id}: type={data.get('type')} "
+                  f"keys={list(data.keys())} "
+                  f"session_id={data.get('session_id')!r} "
+                  f"active_keys={list(active_streams.keys())} "
+                  f"t={_t_recv:.3f}", flush=True)
             # 客户端发来的ping保活
             if data.get("type") == "ping":
                 await websocket.send_json({"type": "pong"})
@@ -906,7 +943,18 @@ async def websocket_push(websocket: WebSocket):
                     try:
                         # 优先检查活跃流（仍在处理中或刚完成的断点续传）
                         stream = active_streams.get(session_id)
-                        if stream and stream["tokens"]:
+                        if stream is not None and not stream["tokens"]:
+                            # 流已注册但还没有 token（刚起步/上游还在思考）。
+                            # 此处绝不能 fallback 到 offline_chats —— 那张表以
+                            # session_id(= device_id) 为主键，同一设备共用一条记录，
+                            # 返回的会是上一轮对话的回复（张冠李戴）。
+                            await websocket.send_json({
+                                "type": "sync_pending_response",
+                                "session_id": session_id,
+                                "content": "",
+                            })
+                            print(f"[Resume] Stream registered but no tokens yet for {session_id}")
+                        elif stream and stream["tokens"]:
                             # 使用服务端记录的已同步序列号防止重复推送（sync retry 会带相同的 last_seq）
                             stream.setdefault("last_synced_seq", -1)
                             effective_seq = max(last_seq, stream["last_synced_seq"])
@@ -968,13 +1016,17 @@ async def websocket_push(websocket: WebSocket):
                                 fallback = None
                                 if device_prefix:
                                     fallback = db.execute(
-                                        "SELECT session_id, content FROM offline_chats WHERE session_id LIKE ? ORDER BY updated_at DESC LIMIT 1",
+                                        "SELECT session_id, content FROM offline_chats WHERE session_id LIKE ? "
+                                        "AND updated_at > datetime('now', '+8 hours', '-15 minutes') "
+                                        "ORDER BY updated_at DESC LIMIT 1",
                                         (device_prefix,)
                                     ).fetchone()
                                 if not fallback:
                                     # 回退3：全局最近一条缓存回复（兜底）
                                     fallback = db.execute(
-                                        "SELECT session_id, content FROM offline_chats ORDER BY updated_at DESC LIMIT 1"
+                                        "SELECT session_id, content FROM offline_chats "
+                                        "WHERE updated_at > datetime('now', '+8 hours', '-15 minutes') "
+                                        "ORDER BY updated_at DESC LIMIT 1"
                                     ).fetchone()
                                 if fallback:
                                     content = fallback[1]
