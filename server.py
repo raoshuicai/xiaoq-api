@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import uuid
 import sqlite3
 import threading
 import time
@@ -869,6 +870,133 @@ async def cron_job_update(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"Cron update error: {e}")
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  会话列表 / 会话消息 API（S12a）
+#
+#  数据源: Hermes 的 ~/.hermes/state.db（sessions / messages 表）
+#  作用域: 只列 source='api_server' 的会话 —— APP 自己产生的那些，
+#          cron / CLI / 其它平台产生的几百个会话不该出现在 APP 列表里
+# ══════════════════════════════════════════════════════════════════════
+
+STATE_DB = Path(os.path.expanduser("~/.hermes/state.db"))
+
+
+def _state_db():
+    if not STATE_DB.exists():
+        raise HTTPException(status_code=500, detail="STATE_DB_MISSING")
+    return sqlite3.connect(str(STATE_DB))
+
+
+@app.get("/api/sessions")
+def list_sessions(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """会话题列表（按 updated_at 倒序）"""
+    check_auth(request)
+    try:
+        db = _state_db()
+        db.row_factory = sqlite3.Row
+
+        # updated_at 用最后一条消息的时间，没有消息时回退 started_at
+        total = db.execute(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'api_server'"
+        ).fetchone()[0]
+
+        rows = db.execute("""
+            SELECT s.id, s.title, s.model, s.started_at, s.message_count,
+                   s.input_tokens, s.output_tokens,
+                   COALESCE((SELECT MAX(m.timestamp) FROM messages m
+                             WHERE m.session_id = s.id), s.started_at) AS updated_at
+            FROM sessions s
+            WHERE s.source = 'api_server'
+            ORDER BY updated_at DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "title": r["title"] or "",
+                "model": r["model"] or "",
+                "started_at": int(r["started_at"]) if r["started_at"] else 0,
+                "updated_at": int(r["updated_at"]) if r["updated_at"] else 0,
+                "message_count": r["message_count"] or 0,
+                "tokens": (r["input_tokens"] or 0) + (r["output_tokens"] or 0),
+            })
+        db.close()
+        return {
+            "items": items,
+            "total": total,
+            "has_more": (offset + len(items)) < total,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sessions error: {e}")
+
+
+@app.get("/api/sessions/{session_id}/messages")
+def session_messages(
+    session_id: str,
+    request: Request,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """某个会话的消息。
+
+    offset 语义：**从最新往历史翻的窗口偏移**。
+      offset=0   -> 最新的一页（limit 条）
+      offset=100 -> 再往前一页
+    返回时始终按时间**正序**排（老的在前），便于界面直接往下追加渲染。
+    """
+    check_auth(request)
+    try:
+        db = _state_db()
+        db.row_factory = sqlite3.Row
+
+        exists = db.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if exists is None:
+            db.close()
+            raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
+
+        total = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+
+        # 先按时间倒序取窗口，再反转成正序返回
+        rows = db.execute("""
+            SELECT id, role, content, timestamp
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ? OFFSET ?
+        """, (session_id, limit, offset)).fetchall()
+        db.close()
+
+        items = []
+        for r in reversed(rows):
+            items.append({
+                "id": r["id"],
+                "role": r["role"] or "",
+                "content": r["content"] or "",
+                "created_at": int(r["timestamp"]) if r["timestamp"] else 0,
+            })
+        return {
+            "items": items,
+            "total": total,
+            "has_more": (offset + len(items)) < total,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session messages error: {e}")
+
+
 @app.post("/api/test-approval")
 async def test_approval(request: Request):
     """测试授权卡片：向所有WebSocket客户端发送approve_request"""
@@ -1340,8 +1468,18 @@ async def websocket_push(websocket: WebSocket):
             # 流式聊天
             elif data.get("type") == "chat":
                 messages = data.get("messages", [])
-                session_id = data.get("session_id", f"harmony-ws-{int(datetime.now().timestamp())}")
-                print(f"[WS] 流式聊天 from {client_id}, messages={len(messages)}")
+                # S12: session_id 现在是「会话 ID」（不再等于 device_id）。
+                #   有值 -> 续接该会话；空 -> 新建，并用 chat_started 回执告知 APP。
+                session_id = data.get("session_id") or ""
+                if not session_id:
+                    session_id = "app-" + uuid.uuid4().hex[:16]
+                    print(f"[WS] 新建会话 {session_id} (client={client_id})", flush=True)
+                print(f"[WS] 流式聊天 from {client_id}, session={session_id}, messages={len(messages)}", flush=True)
+                # 先回执，保证 APP 在第一个 token 之前就知道归属会话
+                await websocket.send_json({
+                    "type": "chat_started",
+                    "session_id": session_id,
+                })
                 await _chat_stream_handler(websocket, messages, session_id)
             # 同步挂起缓存的消息回复（支持断点续流）
             elif data.get("type") == "sync_pending":
