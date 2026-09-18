@@ -1087,6 +1087,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                         "X-Hermes-Session-Id": session_id,
                     },
                 ) as resp:
+                    print(f"[WS-PUSH] gateway responded status={resp.status_code}", flush=True)
                     if resp.status_code != 200:
                         error_body = await resp.aread()
                         print(f"[WS] Hermes API error {resp.status_code}: {error_body[:200]}")
@@ -1212,9 +1213,13 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                                                 "seq": seq,
                                                                 "content": content,
                                                             })
-                                                        except Exception:
-                                                            print(f"[WS] 客户端意外断开，切换到后台流缓存模式 (session_id={session_id})")
+                                                            if seq < 3:
+                                                                print(f"[WS-PUSH] token #{seq} pushed ok (len={len(content)})", flush=True)
+                                                        except Exception as _send_err:
+                                                            print(f"[WS] 客户端意外断开，切换到后台流缓存模式 (session_id={session_id}) err={_send_err}", flush=True)
                                                             client_connected = False
+                                                    elif seq < 3:
+                                                        print(f"[WS-PUSH] token #{seq} NOT pushed (client_connected=False)", flush=True)
                                                     # 无论客户端是否连接，都缓存 token
                                                     active_streams[session_id]["tokens"].append({
                                                         "seq": seq,
