@@ -29,6 +29,29 @@ PROXIES = {
     "http://": "http://127.0.0.1:7897",
     "https://": "http://127.0.0.1:7897",
 }
+
+# 注意：不要加 `-> httpx.AsyncClient` 返回注解 —— Python 会在**定义时**求值注解，
+# 而本模块的 PROXIES/helper 出现在 `import httpx` 之前，加了就会 NameError。
+def _httpx_async_client(timeout: float, use_proxy: bool = False):
+    """统一构造 AsyncClient，屏蔽 httpx 0.28 的 proxies 参数变更。
+
+    use_proxy=True  -> 走 PROXIES 配置（国外服务，如 OpenRouter）
+    use_proxy=False -> 直连且 trust_env=False（国内服务，如华为 Push；
+                       显式忽略环境里的代理变量，避免被兜到 Clash 上反而更慢/失败）
+
+    NOTE: 版本判断放在函数体内做 —— 本模块的 PROXIES 定义在 import httpx
+    之前，模块级引用 httpx 会在加载期直接 NameError。
+    """
+    if not use_proxy:
+        return httpx.AsyncClient(timeout=timeout, trust_env=False)
+    ver = tuple(int(p) for p in httpx.__version__.split(".")[:2] if p.isdigit())
+    if ver < (0, 28):
+        return httpx.AsyncClient(timeout=timeout, proxies=PROXIES)
+    mounts = {}
+    for scheme, url in PROXIES.items():
+        mounts[scheme] = httpx.AsyncHTTPTransport(proxy=url)
+    return httpx.AsyncClient(timeout=timeout, mounts=mounts)
+
 # Load .env for OpenRouter credentials
 _ENV_FILE = Path(os.path.expanduser("~/.hermes/.env"))
 if _ENV_FILE.exists():
@@ -754,7 +777,7 @@ async def chat_direct(request: Request):
     threading.Thread(target=archive_to_hermes, daemon=True).start()
     
     # ── Fast path: stream from OpenRouter directly ──
-    async with httpx.AsyncClient(timeout=120.0, proxies=PROXIES) as client:
+    async with _httpx_async_client(120.0, use_proxy=True) as client:
         resp = await client.request(
             method="POST",
             url=f"{OPENROUTER_URL}/chat/completions",
@@ -1496,7 +1519,7 @@ async def _push_to_huawei(title: str, body: str, source: str = "intel"):
                     "ttl": 86400
                 }
             }
-            async with httpx.AsyncClient(timeout=10.0, proxies=PROXIES) as client:
+            async with _httpx_async_client(10.0, use_proxy=False) as client:
                 push_resp = await client.post(
                     f"https://push-api.cloud.huawei.com/v3/{PUSH_PROJECT_ID}/messages:send",
                     headers={
