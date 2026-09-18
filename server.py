@@ -804,13 +804,16 @@ def cron_job_output_content(job_id: str, name: str, request: Request):
 
 @app.post("/api/cron/jobs/{job_id}/update")
 async def cron_job_update(job_id: str, request: Request):
-    """编辑任务的 name / schedule。
+    """编辑任务的 name / schedule / prompt。
 
-    ⚠️ 只放开这两个字段：
-      - id 由 update_job 的 IMMUTABLE 保护挡住（它是 output 目录名，改了会出事）
-      - prompt / script / no_agent 不在白名单内 —— 这些改动的影响面大，
-        继续在 Hermes 侧用 CLI 改更稳妥
-    schedule 变更后 next_run_at 由 update_job 自动重算。
+    放开范围：
+      - name      ✅
+      - schedule  ✅（变更后 next_run_at 由 update_job 自动重算）
+      - prompt    ✅（用户要求 APP 内可改）
+    仍然挡住：
+      - id        由 update_job 的 IMMUTABLE 保护兜底（它是 output 目录名）
+      - script / no_agent  改了会让任务性质完全变样（Agent 任务变脚本任务），
+                  继续在 Hermes 侧用 CLI 改
     """
     check_auth(request)
     try:
@@ -837,6 +840,14 @@ async def cron_job_update(job_id: str, request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"INVALID_SCHEDULE: {e}")
         updates["schedule"] = expr
+
+    # prompt：用户明确要求 APP 里也能改。
+    # 长度上限给足（prompt 常有几千字），同时挡住异常巨大的输入。
+    if "prompt" in body:
+        p = str(body.get("prompt") or "")
+        if len(p) > 50000:
+            raise HTTPException(status_code=400, detail="PROMPT_TOO_LONG")
+        updates["prompt"] = p
 
     if not updates:
         raise HTTPException(status_code=400, detail="NOTHING_TO_UPDATE")
