@@ -643,6 +643,54 @@ def mark_read(msg_id: int, request: Request):
     return {"status": "ok", "updated": affected > 0}
 
 
+@app.post("/api/push/read")
+async def mark_read_batch(request: Request):
+    """Batch mark-as-read.
+
+    body: {"ids": [1,2,3]}  or  {"all": true}
+    -> {"status": "ok", "updated": N}
+
+    Idempotent: already-read rows are excluded by "read_at IS NULL",
+    so a repeated call returns updated=0.
+    """
+    check_auth(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    mark_all = payload.get("all") is True
+    ids = payload.get("ids")
+
+    if not mark_all and not isinstance(ids, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide 'ids' (list of ints) or 'all': true",
+        )
+
+    db = sqlite3.connect(str(PUSH_DB))
+    if mark_all:
+        cur = db.execute(
+            "UPDATE push_messages SET read_at = datetime('now', '+8 hours') "
+            "WHERE read_at IS NULL"
+        )
+    else:
+        clean = [x for x in ids if isinstance(x, int) and not isinstance(x, bool)]
+        if not clean:
+            db.close()
+            return {"status": "ok", "updated": 0}
+        placeholders = ",".join("?" * len(clean))
+        cur = db.execute(
+            "UPDATE push_messages SET read_at = datetime('now', '+8 hours') "
+            "WHERE read_at IS NULL AND id IN (" + placeholders + ")",
+            clean,
+        )
+    db.commit()
+    updated = cur.rowcount
+    db.close()
+    return {"status": "ok", "updated": updated}
+
+
 @app.get("/api/push/stream")
 async def push_stream(request: Request):
     """SSE endpoint: real-time push delivery to APP."""
@@ -828,11 +876,22 @@ class ConnectionManager:
     async def connect(self, client_id: str, websocket: WebSocket):
         await websocket.accept()
         async with self.lock:
+            old = self.active_connections.get(client_id)
             self.active_connections[client_id] = websocket
+        # 主动关闭被顶替的旧连接：否则旧连接的 except 分支稍后会跑 disconnect，
+        # 把刚注册的新连接从字典里误删（注册表与实际活跃连接脱钩 -> 收不到广播）
+        if old is not None and old is not websocket:
+            try:
+                await old.close(code=1000, reason="replaced by newer connection")
+            except Exception:
+                pass
 
-    async def disconnect(self, client_id: str):
+    async def disconnect(self, client_id: str, websocket: WebSocket = None):
         async with self.lock:
-            self.active_connections.pop(client_id, None)
+            current = self.active_connections.get(client_id)
+            # 只有当前注册的就是自己时才摘除；否则说明已被新连接顶替，不能动
+            if websocket is None or current is websocket:
+                self.active_connections.pop(client_id, None)
 
     async def push(self, client_id: str, message: dict):
         async with self.lock:
@@ -841,7 +900,7 @@ class ConnectionManager:
             try:
                 await ws.send_json(message)
             except Exception:
-                await self.disconnect(client_id)
+                await self.disconnect(client_id, ws)
 
     async def broadcast(self, message: dict):
         async with self.lock:
@@ -1049,10 +1108,10 @@ async def websocket_push(websocket: WebSocket):
                     except Exception as sync_err:
                         print(f"[Offline] Sync pending error: {sync_err}")
     except WebSocketDisconnect:
-        await manager.disconnect(client_id)
+        await manager.disconnect(client_id, websocket)
     except RuntimeError:
         # 客户端连接已关闭但未走标准断开流程
-        await manager.disconnect(client_id)
+        await manager.disconnect(client_id, websocket)
 
 
 async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id: str):
