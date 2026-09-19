@@ -2367,6 +2367,107 @@ async def websocket_push(websocket: WebSocket):
         await manager.disconnect(client_id, websocket)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# S41：每轮对话的性能指标（TTFT / TPS / KV 命中）
+#
+# 数据来源两类，各取其长：
+#   1) **TTFT 自己算** —— WSL 的 Hermes v0.18.0 没有 on_stream_delta 钩子，
+#      perf_metrics.jsonl 的 ttft_* 字段全是 null（实测 1306 行 0% 有值）。
+#      xiaoq-api 自己从"请求发出 → 首个 token 到达"计时，口径与用户感知一致。
+#   2) **TPS / KV 命中读 jsonl** —— tps_wall、cache_hit_rate、*_tokens 有值率 100%。
+#      按 session_id + 时间窗(lookback)圈出本轮的行再聚合。
+#
+# ⚠️ 不用 turn_id 划轮：同一轮的每次工具调用都会生成新的 turn_id 后缀，
+#    拿它当键会把一轮拆成很多"轮"。
+# ═══════════════════════════════════════════════════════════════════════════
+
+PERF_JSONL = Path.home() / ".hermes" / "logs" / "perf_metrics.jsonl"
+
+
+def _read_jsonl_rows(path: Path, since: float, until: float, session_id: str) -> list:
+    """流式读取 jsonl，取 (since <= ts <= until) 且 session_id 匹配的行。
+
+    文件可能上 MB，用逐行 + 提前跳过的方式读，不做全量 json.load。
+    """
+    rows = []
+    if not path.exists():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                # 快速预筛：先看时间戳字段，避免对每行都 json.loads
+                if '"ts"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                ts = r.get("ts")
+                if not isinstance(ts, (int, float)):
+                    continue
+                if ts < since or ts > until:
+                    continue
+                if session_id and str(r.get("session_id", "")) != session_id:
+                    continue
+                rows.append(r)
+    except Exception as e:
+        print(f"[Metrics] read jsonl failed: {e}", flush=True)
+    return rows
+
+
+def _collect_turn_metrics(session_id: str, ttft_ms, started_wall: float) -> dict:
+    """聚合本轮指标。返回给 APP 的 dict（字段缺失时省略，APP 会自动不显示那一项）。"""
+    m = {}
+    if isinstance(ttft_ms, (int, float)) and ttft_ms > 0:
+        m["ttft_ms"] = round(float(ttft_ms), 1)
+
+    # 时间窗：本轮开始往前留 120s 余量（覆盖 Hermes 侧写 jsonl 的少量延迟），
+    # 往后留 10s 容错。窗口内可能混入同一会话上一轮的尾巴 —— 用 session_id 已过滤一次，
+    # 剩下的靠"只看 api_call_count 递增序列"无法完全消除，所以窗口取紧一点更稳。
+    rows = _read_jsonl_rows(PERF_JSONL, since=started_wall - 5.0,
+                            until=time.time() + 10.0, session_id=session_id)
+    if not rows:
+        m["calls"] = 0
+        return m
+
+    # ⚠️ 划轮方式（踩过一次坑）：
+    #   最初用"逐个回溯找 api_call_count==1"——结果两轮数据被混在一起
+    #   （实测同一 session 两次不同 started_wall 得到完全相同的 calls=8）。
+    #   正解：用本轮的 request_started_at 做下限。本轮每次调用（含工具轮）
+    #   都在本轮开始之后才发出，所以 >= started_wall 的行才是本轮的。
+    turn_rows = [r for r in rows
+                 if isinstance(r.get("request_started_at"), (int, float))
+                 and r["request_started_at"] >= started_wall - 3.0]
+    turn_rows.sort(key=lambda r: r.get("request_started_at") or 0)
+
+    out_tokens = sum(int(r.get("output_tokens") or 0) for r in turn_rows)
+    cache_read = sum(int(r.get("cache_read_tokens") or 0) for r in turn_rows)
+    prompt_tok = sum(int(r.get("prompt_tokens") or 0) for r in turn_rows)
+    input_tok = sum(int(r.get("input_tokens") or 0) for r in turn_rows)
+
+    # 本轮墙钟时长：从第一行 request_started_at 到最后一行 request_ended_at
+    starts = [r.get("request_started_at") for r in turn_rows if isinstance(r.get("request_started_at"), (int, float))]
+    ends = [r.get("request_ended_at") for r in turn_rows if isinstance(r.get("request_ended_at"), (int, float))]
+    if starts and ends:
+        span = max(ends) - min(starts)
+        # 纯解码 TPS 优先用 decode_s；WSL 无该字段 → 用 span 近似（含工具轮空窗，偏保守）
+        m["tps"] = round(out_tokens / span, 1) if (span > 0 and out_tokens > 0) else None
+        m["span_s"] = round(span, 2)
+    elif out_tokens > 0:
+        # 只有单行时用 api_duration_s
+        d = sum(float(r.get("api_duration_s") or 0) for r in turn_rows)
+        m["tps"] = round(out_tokens / d, 1) if d > 0 else None
+
+    if prompt_tok > 0:
+        m["kv_hit"] = round(cache_read / prompt_tok, 4)
+
+    m["calls"] = len(turn_rows)
+    m["tokens_in"] = input_tok
+    m["tokens_out"] = out_tokens
+    m["cache_read"] = cache_read
+    return m
+
+
 async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id: str,
                                model: str = ""):
     """通过 Hermes API 流式处理聊天，结果通过 WebSocket 推送
@@ -2404,6 +2505,11 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         await websocket.send_json({"type": "chat_thinking"})
     except Exception:
         pass
+
+    # S41：本轮计时起点（TTFT 的分母）。要在 payload 发出前记，才是用户感知的口径。
+    _turn_t0 = time.monotonic()
+    _turn_started_wall = time.time()
+    _ttft_ms = None
 
     payload = {
         "model": model or "current",
@@ -2534,7 +2640,14 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                 if raw == "[DONE]":
                                     if client_connected:
                                         try:
-                                            await websocket.send_json({"type": "chat_done"})
+                                            # S41：结束帧带上本轮指标（不新增帧类型，老客户端自动忽略）
+                                            _metrics = _collect_turn_metrics(
+                                                session_id, _ttft_ms, _turn_started_wall)
+                                            print(f"[Metrics] chat_done metrics={_metrics}", flush=True)
+                                            await websocket.send_json({
+                                                "type": "chat_done",
+                                                "metrics": _metrics,
+                                            })
                                         except Exception:
                                             client_connected = False
                                 elif raw:
@@ -2549,6 +2662,10 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                                     if my_stream.get("status") != "processing":
                                                         print(f"[WS] 流已被取代，停止处理 (session_id={session_id})", flush=True)
                                                         break
+                                                    # S41：首个 token 到达 → 记 TTFT
+                                                    if not has_tokens:
+                                                        _ttft_ms = (time.monotonic() - _turn_t0) * 1000.0
+                                                        print(f"[Metrics] first token after {_ttft_ms:.0f}ms (session={session_id})", flush=True)
                                                     has_tokens = True
                                                     full_response += content
                                                     # 分配序列号（全部走本次流的局部对象）
@@ -2604,7 +2721,8 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         else:
             if not has_tokens:
                 try:
-                    await websocket.send_json({"type": "chat_done"})
+                    _metrics = _collect_turn_metrics(session_id, _ttft_ms, _turn_started_wall)
+                    await websocket.send_json({"type": "chat_done", "metrics": _metrics})
                 except Exception:
                     pass
         
