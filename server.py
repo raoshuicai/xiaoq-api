@@ -86,9 +86,17 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 active_streams: dict[str, dict] = {}
 
 # ── Approval coordination ────────────────────────────────────────────
-# {run_id: {"event": asyncio.Event, "result": str|None, "session_id": str}}
+# {run_id: {"event": asyncio.Event, "result": str|None, "session_id": str,
+#           "command": str, "description": str, "pattern_keys": list,
+#           "created_at": float, "expired": bool}}
+#
+# S42：超时后**不再删除**，改为标记 expired 保留 —— 这样 APP 端误触/切页/断连
+# 丢失的审批，可以在「设置-审批历史」里找回并继续提交（走直连 Gateway 补交）。
 _pending_approvals: dict[str, dict] = {}
 _approval_event_loop: asyncio.AbstractEventLoop | None = None
+# 审批记录保留时长（秒）。超过则视为彻底过期，查询时顺手清掉。
+# 取 30 分钟：足够用户在手机上滑出去再回来处理，又不至于无限堆积。
+_APPROVAL_KEEP_SECONDS: float = 1800.0
 
 app = FastAPI(title="小Q API", version="1.0.0")
 
@@ -1727,6 +1735,38 @@ def get_memory(request: Request):
     }
 
 
+@app.get("/api/approvals/pending")
+async def list_pending_approvals():
+    """S42：列出未处理的审批（含已超时但保留的）。
+
+    APP 在**启动**与**WS 重连成功**后各拉一次，用于把本地因误触/切页/断连
+    丢失的审批卡片补回队列 —— 这是"误触不再等于永久失联"的关键一环。
+    顺手清理超过 _APPROVAL_KEEP_SECONDS 的僵尸记录。
+    """
+    now = time.time()
+    items = []
+    for run_id, p in list(_pending_approvals.items()):
+        age = now - float(p.get("created_at") or now)
+        if age > _APPROVAL_KEEP_SECONDS:
+            _pending_approvals.pop(run_id, None)
+            continue
+        if p.get("result") is not None:
+            # 已选好、等待后台提交 —— 不该再让用户重复审批
+            continue
+        items.append({
+            "run_id": run_id,
+            "command": p.get("command", ""),
+            "description": p.get("description", ""),
+            "pattern_keys": p.get("pattern_keys", []),
+            "session_id": p.get("session_id", ""),
+            "created_at": p.get("created_at", 0),
+            "age_s": round(age, 1),
+            "expired": bool(p.get("expired", False)),
+        })
+    items.sort(key=lambda x: x.get("created_at", 0))
+    return {"items": items, "count": len(items)}
+
+
 @app.post("/api/test-approval")
 async def test_approval(request: Request):
     """测试授权卡片：向所有WebSocket客户端发送approve_request"""
@@ -2003,10 +2043,14 @@ async def proxy_hermes_v1(request: Request, path: str):
             choice = body_data.get("choice", body_data.get("approval", "deny"))
             run_id = path.split("/")[1]
             pending = _pending_approvals.get(run_id)
-            if pending:
+            if pending is not None and not pending.get("expired"):
                 pending["result"] = choice
                 pending["event"].set()
                 print(f"[Proxy] 审批拦截同步: run={run_id[:12]}, choice={choice}")
+            elif pending is not None:
+                # S42：已超时的记录 —— 交给下面的代理请求直接补交 Gateway
+                _pending_approvals.pop(run_id, None)
+                print(f"[Proxy] 审批为超时记录，交由代理补交: run={run_id[:12]}", flush=True)
         except Exception:
             pass
 
@@ -2184,18 +2228,24 @@ async def websocket_push(websocket: WebSocket):
                 choice = data.get("choice", "deny")
                 print(f"[WS] 授权回复 from {client_id}: run={run_id[:12] if run_id else '?'}, choice={choice}")
                 pending = _pending_approvals.get(run_id)
-                if pending:
+                if pending is not None and not pending.get("expired"):
+                    # 正常路径：等待循环还活着，后台唤醒即可
                     pending["result"] = choice
                     pending["event"].set()
                 else:
-                    # No pending approval — try direct Gateway call anyway
+                    # 没有 pending，或 pending 已超时（等待循环早已退出）→
+                    # S42：直连 Gateway 补交。只要 Gateway 侧的 run 仍在等审批就能成功，
+                    #      这正是"事后在审批历史里继续执行"的落地路径。
+                    if pending is not None:
+                        _pending_approvals.pop(run_id, None)
                     try:
-                        async with httpx.AsyncClient(timeout=5.0) as ac:
-                            await ac.post(
+                        async with httpx.AsyncClient(timeout=10.0) as ac:
+                            _r = await ac.post(
                                 f"{HERMES_API}/v1/runs/{run_id}/approval",
                                 json={"choice": choice},
                                 headers={"Authorization": f"Bearer {GATEWAY_KEY}" if GATEWAY_KEY else ""},
                             )
+                            print(f"[WS] 事后审批补交: choice={choice}, HTTP {_r.status_code} (run={run_id[:12]})", flush=True)
                     except Exception as e:
                         print(f"[WS] 直接审批回复失败: {e}")
             # 流式聊天
@@ -2583,6 +2633,12 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             "event": approval_event,
                                             "result": None,
                                             "session_id": session_id,
+                                            # S42：带上完整上下文，供事后恢复时重建卡片
+                                            "command": approval_evt.get("command", ""),
+                                            "description": approval_evt.get("description", ""),
+                                            "pattern_keys": approval_evt.get("pattern_keys", []),
+                                            "created_at": time.time(),
+                                            "expired": False,
                                         }
                                         # Forward to APP
                                         await websocket.send_json({
@@ -2628,11 +2684,21 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             except Exception as e:
                                                 print(f"[WS] 审批回复提交失败: {e} (run={run_id[:12]})")
                                         else:
-                                            print(f"[WS] 审批等待超时 (run={run_id[:12]})")
+                                            # S42：不再"静默丢弃"。标记 expired 但保留记录，
+                                            #      让 APP 的「设置-审批历史」能找回并继续审批。
+                                            _pexp = _pending_approvals.get(run_id)
+                                            if _pexp is not None:
+                                                _pexp["expired"] = True
+                                                _pexp["expired_at"] = time.time()
+                                            print(f"[WS] 审批等待超时 (run={run_id[:12]}) —— 记录已保留，供事后审批", flush=True)
                                 except json.JSONDecodeError:
                                     pass
                                 finally:
-                                    _pending_approvals.pop(run_id, None)
+                                    # S42：已正常处理 → 移除；超时（expired）→ **保留**，
+                                    #      供用户在审批历史里找回后继续提交。
+                                    _pfin = _pending_approvals.get(run_id)
+                                    if _pfin is None or not _pfin.get("expired"):
+                                        _pending_approvals.pop(run_id, None)
                                 continue
                             # Standard OpenAI chat completion data
                             if data_line:
