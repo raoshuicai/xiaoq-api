@@ -253,7 +253,83 @@ th,td{border:1px solid #e2e2ea;padding:7px 11px;text-align:left;white-space:nowr
 th{background:#f5f5fa;font-weight:600}
 tbody tr:nth-child(even){background:#fafafd}
 img{max-width:100%;height:auto;border-radius:6px}
+/* S18 frontmatter 信息卡 */
+.fm-card{background:#f7f8fc;border:1px solid #e8e8f0;border-radius:10px;
+         padding:12px 14px;margin:0 0 18px}
+.fm-title{font-size:17px;font-weight:600;line-height:1.45;color:#1a1a2e}
+.fm-meta{font-size:12.5px;color:#8a8a9a;margin-top:6px}
+.fm-tags{margin-top:9px}
+.fm-tag{display:inline-block;font-size:11.5px;color:#5B5BD6;background:#ececfb;
+        border-radius:10px;padding:2px 9px;margin:0 6px 6px 0}
 """
+
+
+# frontmatter 里要展示的字段（顺序即卡片上的顺序）
+_FM_SHOW = ("title", "date", "issue", "tags", "source", "status")
+# 明确隐藏的内部字段（长 ID / 外链，对阅读无价值）
+_FM_HIDE = ("wechat_media_id", "zhihu_url", "media_id", "url", "id")
+
+
+def _split_frontmatter(text: str):
+    """拆出 (frontmatter_dict, 正文)。没有 frontmatter 或解析失败 -> ({}, 原文)。"""
+    if not text.startswith("---"):
+        return {}, text
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text
+    raw = text[3:end].strip()
+    body = text[end + 4:].lstrip("\n")
+    fm = {}
+    for line in raw.split("\n"):
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip().strip('"').strip("'")
+        if k and v:
+            fm[k] = v
+    return fm, body
+
+
+def _frontmatter_card(fm: dict) -> str:
+    """把 frontmatter 渲染成信息卡。无可用字段时返回空串（不产生空卡片）。"""
+    if not fm:
+        return ""
+
+    import html as _h
+    rows = []
+
+    title = fm.get("title", "")
+    if title:
+        rows.append('<div class="fm-title">' + _h.escape(title) + '</div>')
+
+    meta = []
+    if fm.get("date"):
+        meta.append(_h.escape(fm["date"]))
+    if fm.get("issue"):
+        meta.append("第 " + _h.escape(str(fm["issue"])) + " 期")
+    if fm.get("source"):
+        meta.append(_h.escape(fm["source"]))
+    if fm.get("status"):
+        meta.append(_h.escape(fm["status"]))
+    if meta:
+        rows.append('<div class="fm-meta">' + ' · '.join(meta) + '</div>')
+
+    tags = fm.get("tags", "")
+    if tags:
+        # [a, b, c] -> 小胶囊
+        t = tags.strip().strip("[]")
+        chips = []
+        for x in t.split(","):
+            x = x.strip().strip('"').strip("'")
+            if x:
+                chips.append('<span class="fm-tag">' + _h.escape(x) + '</span>')
+        if chips:
+            rows.append('<div class="fm-tags">' + ''.join(chips) + '</div>')
+
+    if not rows:
+        return ""
+    return '<div class="fm-card">' + ''.join(rows) + '</div>'
 
 
 def _render_md_html(rel_path: str, full_path) -> str:
@@ -265,11 +341,14 @@ def _render_md_html(rel_path: str, full_path) -> str:
         return hit[2]
 
     text = full_path.read_text(encoding="utf-8", errors="replace")
+    # S18：frontmatter 单独摘出来做成信息卡，不混进正文（否则一堆 key: value 很吵）
+    fm, md_body = _split_frontmatter(text)
+    card = _frontmatter_card(fm)
     try:
         import markdown_it
         md = markdown_it.MarkdownIt("commonmark", {"html": True})
         md.enable("table")          # Vault 大量使用 GFM 表格，默认 commonmark 不认
-        body = md.render(text)
+        body = card + md.render(md_body)
     except Exception as e:          # 渲染失败不能让整个阅读功能挂掉 → 退回纯文本
         print(f"[MD] render failed, fallback to plain text: {e}", flush=True)
         import html as _h
@@ -1106,6 +1185,30 @@ def delete_session(session_id: str, request: Request):
         raise HTTPException(status_code=500, detail=f"Delete error: {e}")
 
 
+def _clear_offline_cache(session_id: str) -> int:
+    """
+    删除某会话的离线缓存（S19）。
+
+    ⚠️ 为什么在"历史已送达"之后清：offline_chats 是给**断线期间**没收到回复的客户端
+    补投用的。一旦 APP 通过 /messages 拉到完整历史（其中已含该回复），缓存就完成使命了
+    —— 留着的话，之后任何一次 sync_pending 都会把同一份内容再投一遍，
+    用户会看到两条一模一样的回复（实测会话 app-42015772fca4497d）。
+    """
+    try:
+        db = sqlite3.connect(str(PUSH_DB))
+        cur = db.execute("DELETE FROM offline_chats WHERE session_id = ?", (session_id,))
+        db.commit()
+        n = cur.rowcount
+        db.close()
+        if n:
+            print(f"[Offline] cleared {n} cache row(s) after history sync for {session_id}",
+                  flush=True)
+        return n
+    except Exception as e:
+        print(f"[Offline] clear cache failed for {session_id}: {e}", flush=True)
+        return 0
+
+
 @app.get("/api/sessions/{session_id}/messages")
 def session_messages(
     session_id: str,
@@ -1154,6 +1257,10 @@ def session_messages(
                 "content": r["content"] or "",
                 "created_at": int(r["timestamp"]) if r["timestamp"] else 0,
             })
+        # S19：历史已送达 → 清掉该会话的离线缓存，避免后续 sync_pending 重复投递同一份内容
+        # （只在 offset=0 时清：分页翻更早的历史不该动缓存）
+        if offset == 0:
+            _clear_offline_cache(session_id)
         return {
             "items": items,
             "total": total,
