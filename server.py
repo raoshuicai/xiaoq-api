@@ -902,26 +902,39 @@ def list_sessions(
         db.row_factory = sqlite3.Row
 
         # updated_at 用最后一条消息的时间，没有消息时回退 started_at
+        # archived=1 的会话是用户在 APP 里删掉的（软删除，Hermes 侧数据保留）
         total = db.execute(
             "SELECT COUNT(*) FROM sessions WHERE source = 'api_server'"
+            " AND COALESCE(archived, 0) = 0"
         ).fetchone()[0]
 
         rows = db.execute("""
             SELECT s.id, s.title, s.model, s.started_at, s.message_count,
                    s.input_tokens, s.output_tokens,
                    COALESCE((SELECT MAX(m.timestamp) FROM messages m
-                             WHERE m.session_id = s.id), s.started_at) AS updated_at
+                             WHERE m.session_id = s.id), s.started_at) AS updated_at,
+                   (SELECT m.content FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user'
+                       AND m.content IS NOT NULL AND TRIM(m.content) <> ''
+                     ORDER BY m.timestamp ASC LIMIT 1) AS first_user_msg
             FROM sessions s
             WHERE s.source = 'api_server'
+              AND COALESCE(s.archived, 0) = 0
             ORDER BY updated_at DESC
             LIMIT ? OFFSET ?
         """, (limit, offset)).fetchall()
 
         items = []
         for r in rows:
+            # 默认标题：优先用 Hermes 写好的 title；没有就用首条用户消息
+            # （截断到 20 字）——避免客户端只能显示 app-xxxx 这种看不出内容的 ID
+            _t = (r["title"] or "").strip()
+            if not _t:
+                _f = (r["first_user_msg"] or "").strip().replace("\n", " ")
+                _t = _f[:20] + ("…" if len(_f) > 20 else "")
             items.append({
                 "id": r["id"],
-                "title": r["title"] or "",
+                "title": _t,
                 "model": r["model"] or "",
                 "started_at": int(r["started_at"]) if r["started_at"] else 0,
                 "updated_at": int(r["updated_at"]) if r["updated_at"] else 0,
@@ -938,6 +951,63 @@ def list_sessions(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sessions error: {e}")
+
+
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request):
+    """重命名会话（写 Hermes sessions.title）"""
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="INVALID_BODY")
+    title = (body.get("title") or "").strip()
+    if len(title) == 0:
+        raise HTTPException(status_code=400, detail="EMPTY_TITLE")
+    if len(title) > 60:
+        title = title[:60]
+    try:
+        db = _state_db()
+        cur = db.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
+        )
+        db.commit()
+        changed = cur.rowcount
+        db.close()
+        if changed == 0:
+            raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
+        return {"status": "ok", "id": session_id, "title": title}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Rename error: {e}")
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str, request: Request):
+    """
+    删除会话。
+
+    ⚠️ 只做**软删除**（archived=1）：Hermes 的 sessions / messages 数据一律不动。
+    理由：APP 端删错了要能恢复，而且这些表同时被 cron、WebUI、桌面端共用，
+    真删会连带影响别的入口（历史的教训：把别人在用的数据删掉，排查起来极难）。
+    """
+    check_auth(request)
+    try:
+        db = _state_db()
+        cur = db.execute(
+            "UPDATE sessions SET archived = 1 WHERE id = ?", (session_id,)
+        )
+        db.commit()
+        changed = cur.rowcount
+        db.close()
+        if changed == 0:
+            raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
+        return {"status": "ok", "id": session_id, "archived": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete error: {e}")
 
 
 @app.get("/api/sessions/{session_id}/messages")
