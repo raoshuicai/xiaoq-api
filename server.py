@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
+from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -151,6 +153,181 @@ def download_apk():
 # ══════════════════════════════════════════════════════════════════════
 #  文件浏览 API
 # ══════════════════════════════════════════════════════════════════════
+
+# ─────────────────── S22：上传（图片 / 文件）───────────────────
+
+UPLOAD_DIR = Path(os.path.expanduser("~/.hermes/uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024      # 20MB
+
+
+def _safe_upload_name(raw: str) -> str:
+    """
+    清洗上传文件名，只保留 [A-Za-z0-9._-]，其余替换为下划线。
+
+    ⚠️ 必须做：filename 完全来自客户端，直接拼路径会被 `../../` 穿越到任意位置。
+    这里连路径分隔符一起过滤，从源头消灭穿越可能；GET 侧还会再复核一次。
+    """
+    base = os.path.basename(raw or "upload.bin")
+    safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in base)
+    safe = safe.lstrip(".") or "upload.bin"
+    return safe[:120]
+
+
+@app.post("/api/upload")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    """上传图片/文件，返回可访问 URL（S22）。"""
+    check_auth(request)
+    try:
+        data = await file.read()
+        if len(data) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=413, detail="FILE_TOO_LARGE")
+
+        # ⚠️ 保留原名、不加时间戳前缀：客户端用的是系统级 uploadFile，
+        #    **它不返回响应体** —— 客户端拿不到这里 JSON 里的 url，
+        #    只能靠"服务端用原名存储"自己拼出可预测的 URL。
+        #    代价是同名覆盖，对"发一张图/文件给助手看"这个场景可以接受。
+        name = _safe_upload_name(file.filename or "upload.bin")
+        target = UPLOAD_DIR / name
+        target.write_bytes(data)
+
+        ctype = file.content_type or "application/octet-stream"
+        print(f"[Upload] {name} ({len(data)} bytes, {ctype})", flush=True)
+        return {
+            "status": "ok",
+            "name": name,
+            "size": len(data),
+            "content_type": ctype,
+            "url": f"/api/upload/{name}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload error: {e}")
+
+
+# ─────────────────── 图片标记 → 原生视觉内容块 ───────────────────
+#
+# 背景：APP 的「图片」菜单走系统 uploadFile，服务端确认过它**拿不到响应体**，
+# 所以客户端只能把 `[图片] /api/upload/<name>` 当纯文本塞进输入框发过来。
+# 模型收到的是一行字符串，看不到图。这里在转发给 Gateway 之前把它还原成
+# 真正的图片块，用上 DeepSeek V4.1 Flash 的原生视觉。
+#
+# ⚠️ 必须 base64 内联，不能直接把 /api/upload/xxx 的 URL 传给模型 ——
+#    DeepSeek 是**它自己的服务器**去下载你给的外部链接，而那个地址是内网的
+#    （192.168.3.87:8866），它够不着。
+# ⚠️ 只处理**最后一条** user 消息。历史里的图不回头重编码：那会让每轮请求
+#    都背上几十 MB 的历史图片，而且会改动缓存前缀。
+# ⚠️ 单图有大小上限，见 MAX_INLINE_IMAGE_BYTES。
+
+_IMG_MARKER_RE = re.compile(r"\[图片\]\s*/?api/upload/([A-Za-z0-9._-]+)")
+_MIME_BY_EXT = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+}
+# base64 后体积约 ×1.37。8MB 原图 → 约 11MB 字符串，给 WS 消息和 DeepSeek
+# 48MiB 请求体都留了余量。调大前先想清楚内存压力。
+MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def _inline_image_markers(messages):
+    """把最后一条 user 消息里的 `[图片] /api/upload/<name>` 换成图片块。
+
+    返回 (新 messages, 内联成功的张数)。没有标记时原样返回，零开销。
+
+    内容块用 OpenAI 原生 vision 格式（content 从字符串变成
+    [{"type":"text"},{"type":"image_url"}] 数组），Gateway 的
+    _normalize_multimodal_content 直接认，agent 内核也原样透传给
+    OpenAI-wire provider。
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages, 0
+
+    idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if isinstance(m, dict) and m.get("role") == "user":
+            idx = i
+            break
+    if idx < 0:
+        return messages, 0
+
+    msg = messages[idx]
+    content = msg.get("content")
+    if not isinstance(content, str) or "[图片]" not in content:
+        return messages, 0
+
+    uploads_root = str(UPLOAD_DIR.resolve())
+    blocks = []
+    inlined = 0
+    pos = 0
+
+    for mt in _IMG_MARKER_RE.finditer(content):
+        head = content[pos:mt.start()].strip()
+        if head:
+            blocks.append({"type": "text", "text": head})
+        pos = mt.end()
+
+        name = _safe_upload_name(mt.group(1))
+        path = (UPLOAD_DIR / name).resolve()
+        # 复核没逃出 uploads 目录（name 已被清洗，这是第二道防线）
+        if not str(path).startswith(uploads_root):
+            blocks.append({"type": "text", "text": f"[图片路径非法: {name}]"})
+            continue
+
+        mime = _MIME_BY_EXT.get(path.suffix.lower())
+        if mime is None:
+            blocks.append({"type": "text",
+                           "text": f"[非图片格式，未内联: {name}]"})
+            continue
+
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            print(f"[Vision] 读图失败 {name}: {e}", flush=True)
+            blocks.append({"type": "text", "text": f"[图片读取失败: {name}]"})
+            continue
+
+        if len(data) > MAX_INLINE_IMAGE_BYTES:
+            mb = len(data) / 1024 / 1024
+            print(f"[Vision] {name} 过大({mb:.1f}MB)，未内联", flush=True)
+            blocks.append({"type": "text",
+                           "text": f"[图片过大未内联: {name}，{mb:.1f}MB]"})
+            continue
+
+        b64 = base64.b64encode(data).decode("ascii")
+        blocks.append({"type": "image_url",
+                       "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        inlined += 1
+        print(f"[Vision] 内联 {name} ({len(data)}B, {mime})", flush=True)
+
+    tail = content[pos:].strip()
+    if tail:
+        blocks.append({"type": "text", "text": tail})
+
+    if inlined == 0:
+        # 一张都没成 → 保持纯文本原样。用户至少能在回复里看到上面的报错文字。
+        return messages, 0
+
+    out = list(messages)
+    nm = dict(msg)
+    nm["content"] = blocks
+    out[idx] = nm
+    return out, inlined
+
+
+@app.get("/api/upload/{name}")
+def get_upload(name: str):
+    """按名取回上传的文件（客户端预览 / 多模态消息引用）。"""
+    safe = _safe_upload_name(name)
+    target = (UPLOAD_DIR / safe).resolve()
+    # 复核：解析后必须仍在 uploads 目录内
+    if not str(target).startswith(str(UPLOAD_DIR.resolve())):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="UPLOAD_NOT_FOUND")
+    return FileResponse(str(target))
+
 
 @app.get("/api/files")
 def list_files(request: Request, path: str = Query("", description="Obsidian 内相对路径")):
@@ -1277,6 +1454,39 @@ def session_messages(
 # ══════════════════════════════════════════════════════════════════════
 
 HERMES_CONFIG = Path(os.path.expanduser("~/.hermes/config.yaml"))
+# APP 专属模型覆盖（**不动全局 config.yaml**）。
+# APP 的「模型」页切模型时写在这里，只影响 APP 自己发起的对话；
+# WebUI / Desktop / CLI 继续走 config.yaml 的全局默认，互不干扰。
+APP_MODEL_STATE = Path(os.path.expanduser("~/.hermes/xiaoq_app_model.json"))
+
+
+def _load_app_model() -> dict:
+    """读 APP 的模型覆盖；未设置/文件损坏 → 返回 {}（回落全局默认）。"""
+    try:
+        d = json.loads(APP_MODEL_STATE.read_text(encoding="utf-8"))
+        mid = str(d.get("id") or "").strip()
+        if not mid:
+            return {}
+        return {"id": mid, "provider": str(d.get("provider") or "").strip()}
+    except Exception:
+        return {}
+
+
+def _save_app_model(mid: str, provider: str) -> None:
+    """原子写 APP 模型覆盖。mid 为空 = 清除覆盖，回全局默认。"""
+    if not mid:
+        try:
+            APP_MODEL_STATE.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    tmp = str(APP_MODEL_STATE) + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"id": mid, "provider": provider,
+                   "updated_at": datetime.now(TZ).isoformat()},
+                  f, ensure_ascii=False, indent=2)
+    os.replace(tmp, str(APP_MODEL_STATE))
+
 HERMES_SKILLS_DIR = Path(os.path.expanduser("~/.hermes/skills"))
 HERMES_MEMORY = Path(os.path.expanduser("~/.hermes/memories/MEMORY.md"))
 
@@ -1295,9 +1505,24 @@ def _load_hermes_config():
 
 
 def _collect_models(cfg: dict) -> list:
-    """从配置里汇总"这套配置真实用到过"的模型，去重后返回"""
+    """可用模型清单。
+
+    数据源优先级（B 方案，2026-09-19）：
+      1. gateway.platforms.api_server.extra.model_routes —— APP 侧可切的路由，
+         每条都带**真实 provider**（上游 Gateway 原生机制，per-request 生效）
+      2. 没有 model_routes 时回退旧逻辑：从 model/moa/auxiliary 里扫
+
+    `current` 标记只认全局 model.default + model.provider 全匹配的那条。
+    历史 bug：只比 model 名不比 provider，导致
+    default=gemini-2.5-flash/provider=deepseek 这种错配下，APP 显示"已切到
+    gemini"但实际仍走 DeepSeek。这里两个字段必须同时匹配。
+    """
     cur_model = ((cfg.get("model") or {}).get("default")) or ""
     cur_provider = ((cfg.get("model") or {}).get("provider")) or ""
+    # APP 有覆盖时，current 标记跟着 APP 走（这个接口只有 APP 用）
+    _app = _load_app_model()
+    eff_model = _app.get("id") or cur_model
+    eff_provider = _app.get("provider") or cur_provider
     seen = {}
     order = []
 
@@ -1312,32 +1537,50 @@ def _collect_models(cfg: dict) -> list:
         seen[key] = {"id": mid, "name": mid, "provider": prov or "", "current": is_cur}
         order.append(key)
 
-    add(cur_model, cur_provider, True)
-
-    moa = cfg.get("moa") or {}
-    for m in (moa.get("reference_models") or []):
-        if isinstance(m, dict):
-            add(m.get("model"), m.get("provider"))
-    agg = moa.get("aggregator") or {}
-    if isinstance(agg, dict):
-        add(agg.get("model"), agg.get("provider"))
-    presets = moa.get("presets") or {}
-    if isinstance(presets, dict):
-        for _, pv in presets.items():
-            if not isinstance(pv, dict):
+    # ① 首选 model_routes
+    routes = (((cfg.get("gateway") or {}).get("platforms") or {})
+              .get("api_server") or {}).get("extra") or {}
+    routes = routes.get("model_routes") or {}
+    if isinstance(routes, dict):
+        for alias, rc in routes.items():
+            if not isinstance(rc, dict):
                 continue
-            for m in (pv.get("reference_models") or []):
-                if isinstance(m, dict):
-                    add(m.get("model"), m.get("provider"))
-            a = pv.get("aggregator") or {}
-            if isinstance(a, dict):
-                add(a.get("model"), a.get("provider"))
+            m = str(rc.get("model") or alias).strip()
+            p = str(rc.get("provider") or "").strip()
+            if not m:
+                continue
+            # 当前生效模型（APP 覆盖优先）+ provider 必须同时匹配
+            is_cur = (m == eff_model and (not p or not eff_provider or p == eff_provider))
+            add(alias if alias != m else m, p, is_cur)
 
-    aux = cfg.get("auxiliary") or {}
-    if isinstance(aux, dict):
-        for _, av in aux.items():
-            if isinstance(av, dict) and av.get("provider") not in (None, "auto"):
-                add(av.get("model"), av.get("provider"))
+    if not order:
+        # ② 回退：老逻辑
+        add(eff_model, eff_provider, True)
+
+        moa = cfg.get("moa") or {}
+        for m in (moa.get("reference_models") or []):
+            if isinstance(m, dict):
+                add(m.get("model"), m.get("provider"))
+        agg = moa.get("aggregator") or {}
+        if isinstance(agg, dict):
+            add(agg.get("model"), agg.get("provider"))
+        presets = moa.get("presets") or {}
+        if isinstance(presets, dict):
+            for _, pv in presets.items():
+                if not isinstance(pv, dict):
+                    continue
+                for m in (pv.get("reference_models") or []):
+                    if isinstance(m, dict):
+                        add(m.get("model"), m.get("provider"))
+                a = pv.get("aggregator") or {}
+                if isinstance(a, dict):
+                    add(a.get("model"), a.get("provider"))
+
+        aux = cfg.get("auxiliary") or {}
+        if isinstance(aux, dict):
+            for _, av in aux.items():
+                if isinstance(av, dict) and av.get("provider") not in (None, "auto"):
+                    add(av.get("model"), av.get("provider"))
 
     return [seen[k] for k in order]
 
@@ -1353,10 +1596,21 @@ def list_models(request: Request):
 
 @app.post("/api/models/switch")
 async def switch_model(request: Request):
-    """切换默认模型（改 config.yaml 的 model.default）。
+    """切换 **APP 自己** 用的模型（写 ~/.hermes/xiaoq_app_model.json）。
+
+    为什么不再改 config.yaml 的 model.default（2026-09-19 重构）：
+      config.yaml 的 model 段是**全局单点** —— WebUI / Desktop / CLI / APP
+      全读它。APP 切一下，所有人的模型都跟着变，这不是我们要的隔离。
+      而且旧实现只写 default 不写 provider，造成
+      `default=gemini-2.5-flash` + `provider=deepseek` 的错配，上游收到
+      不认识的模型名后静默回落到 provider 自己的默认模型 —— 表现就是
+      "APP 显示已切到 gemini，回话还是 DeepSeek"（本次定位的 bug）。
+
+    现在：覆盖只存在本地小状态里，只影响 APP 发起的对话；
+    WebUI / Desktop / CLI 继续走全局默认。
+    `id` 传空串 / "current" / "default" = 清除覆盖，回全局默认。
 
     ⚠️ 生效时机 = **下一次对话**（不动正在进行的流）。
-    ⚠️ 只改 model.default 一个字段；写前备份、原子替换。
     """
     check_auth(request)
     try:
@@ -1365,45 +1619,57 @@ async def switch_model(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     mid = str(body.get("id") or "").strip()
-    if not mid:
-        raise HTTPException(status_code=400, detail="MODEL_ID_REQUIRED")
+
+    # 清除覆盖 → 回全局默认
+    if mid in ("", "current", "default", "reset"):
+        _save_app_model("", "")
+        print("[Models] APP 覆盖已清除，回落全局默认", flush=True)
+        return {
+            "id": "",
+            "provider": "",
+            "scope": "global",
+            "applied_at": datetime.now(TZ).isoformat(),
+            "previous": (_load_hermes_config().get("model") or {}).get("default") or "",
+            "note": "已恢复全局默认模型，下一次对话生效",
+        }
 
     cfg = _load_hermes_config()
-    allowed = {m["id"] for m in _collect_models(cfg)}
+    items = _collect_models(cfg)
+    allowed = {m["id"] for m in items}
     if mid not in allowed:
         # 不在配置已知集合里 —— 不直接拒绝（用户可能想用新模型），但要显式确认
         if body.get("force") is not True:
             raise HTTPException(status_code=404, detail="MODEL_NOT_FOUND")
 
-    try:
-        import yaml
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"YAML_UNAVAILABLE: {e}")
+    # provider 从路由表反查（必须带上，否则又变成"只换名字不换后端"）
+    provider = str(body.get("provider") or "").strip()
+    if not provider:
+        for m in items:
+            if m["id"] == mid and m.get("provider"):
+                provider = m["provider"]
+                break
+    if not provider:
+        raise HTTPException(
+            status_code=409,
+            detail="PROVIDER_UNRESOLVED: 该模型不在 model_routes 里，"
+                   "无法确定 provider（请在 config.yaml 的 "
+                   "gateway.platforms.api_server.extra.model_routes 里补一条）",
+        )
 
-    # 备份
+    prev = _load_app_model()
     try:
-        shutil.copy(str(HERMES_CONFIG), str(HERMES_CONFIG) + ".bak-modelswitch")
-    except Exception:
-        pass
-
-    try:
-        cfg.setdefault("model", {})
-        old = cfg["model"].get("default")
-        cfg["model"]["default"] = mid
-
-        tmp = str(HERMES_CONFIG) + ".tmp"
-        with io.open(tmp, "w", encoding="utf-8") as f:
-            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
-        os.replace(tmp, str(HERMES_CONFIG))
+        _save_app_model(mid, provider)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MODEL_SWITCH_WRITE_FAILED: {e}")
 
-    print(f"[Models] default model: {old} -> {mid}", flush=True)
+    print(f"[Models] APP 模型: {prev.get('id') or '(全局)'} -> {mid} ({provider})", flush=True)
     return {
         "id": mid,
+        "provider": provider,
+        "scope": "app",
         "applied_at": datetime.now(TZ).isoformat(),
-        "previous": old,
-        "note": "下一次对话生效",
+        "previous": prev.get("id") or "",
+        "note": "仅影响 APP，下一次对话生效；WebUI/Desktop/CLI 不受影响",
     }
 
 
@@ -1935,6 +2201,18 @@ async def websocket_push(websocket: WebSocket):
             # 流式聊天
             elif data.get("type") == "chat":
                 messages = data.get("messages", [])
+                # 图片标记 → 原生视觉内容块（DeepSeek V4.1 Flash 识图）。
+                # APP 的「图片」菜单只能发 `[图片] /api/upload/x.jpg` 纯文本，
+                # 这里还原成真的图片块；没有标记时零开销直接返回。
+                messages, n_img = _inline_image_markers(messages)
+                if n_img:
+                    print(f"[WS] 已内联 {n_img} 张图片", flush=True)
+                # 模型：APP 消息里显式带 → 用它；否则用 APP 本地覆盖；都没有 → 全局默认。
+                # 两者都靠 Gateway 的 model_routes 解析成真实 provider+model，
+                # per-request 生效，不动全局 config.yaml。
+                req_model = str(data.get("model") or "").strip()
+                if not req_model:
+                    req_model = _load_app_model().get("id") or ""
                 # S12: session_id 现在是「会话 ID」（不再等于 device_id）。
                 #   有值 -> 续接该会话；空 -> 新建，并用 chat_started 回执告知 APP。
                 session_id = data.get("session_id") or ""
@@ -1962,7 +2240,7 @@ async def websocket_push(websocket: WebSocket):
                     "type": "chat_started",
                     "session_id": session_id,
                 })
-                await _chat_stream_handler(websocket, messages, session_id)
+                await _chat_stream_handler(websocket, messages, session_id, req_model)
             # 同步挂起缓存的消息回复（支持断点续流）
             elif data.get("type") == "sync_pending":
                 session_id = data.get("session_id")
@@ -2089,8 +2367,16 @@ async def websocket_push(websocket: WebSocket):
         await manager.disconnect(client_id, websocket)
 
 
-async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id: str):
-    """通过 Hermes API 流式处理聊天，结果通过 WebSocket 推送"""
+async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id: str,
+                               model: str = ""):
+    """通过 Hermes API 流式处理聊天，结果通过 WebSocket 推送
+
+    `model` = APP 侧选中的模型别名（来自 /api/models 的 id）。
+    Gateway 的 model_routes 会按这个字段解析出真实的 provider + model，
+    做到 per-request 切模型，而**不动全局 model.default** —— 所以 WebUI /
+    Desktop / CLI 仍走各自的默认模型，互不干扰。
+    空串 = 用全局默认（"current" 是 Gateway 的兜底值）。
+    """
     # S12 修：同一 session 只允许一个活跃流。
     # 断线重连时旧连接的 handler 可能仍在跑（await 未结束），新连接又发起一个 ——
     # 若不处理，下面那行赋值会把旧流的对象直接丢掉，而旧流后续仍按 session_id
@@ -2120,7 +2406,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         pass
 
     payload = {
-        "model": "current",
+        "model": model or "current",
         "stream": True,
         "messages": messages,
     }
