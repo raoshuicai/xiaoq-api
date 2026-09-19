@@ -1795,11 +1795,17 @@ async def websocket_push(websocket: WebSocket):
                                     match_type = "device" if device_prefix else "global"
                                     print(f"[Offline] {match_type} fallback: returned cached response for {session_id}")
                                 else:
+                                    # 没有任何活跃流、也没有离线缓存 → 明确告知客户端"别再等了"。
+                                    # 此前这里与「流刚起步还没 token」一样只回 content:""，
+                                    # 客户端无法区分二者：重试 60 秒计时器耗尽后 isStreaming 仍是 true，
+                                    # 占位符「恢复中」永远不消失（用户实测：会话一直卡住不恢复）。
                                     await websocket.send_json({
                                         "type": "sync_pending_response",
                                         "session_id": session_id,
                                         "content": "",
+                                        "stream_missing": True,
                                     })
+                                    print(f"[Resume] No active stream & no cache for {session_id} -> stream_missing")
                             db.close()
                     except Exception as sync_err:
                         print(f"[Offline] Sync pending error: {sync_err}")
