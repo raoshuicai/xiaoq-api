@@ -1196,10 +1196,13 @@ async def test_approval(request: Request):
     _long_cmd = "rm -rf /data/production/db && " + " && ".join(
         ["cp -r /etc/nginx/conf.d/%d /backup/nginx_%d" % (i, i) for i in range(1, 21)]
     )
+    # 允许调用方指定 command 与 run_id，便于验证"同一 run 多次审批"的场景
+    _cmd_override = request.query_params.get("command", "")
+    _run_override = request.query_params.get("run_id", "test-run-001")
     await manager.broadcast({
         "type": "approve_request",
-        "run_id": "test-run-001",
-        "command": _long_cmd,
+        "run_id": _run_override,
+        "command": (_cmd_override if _cmd_override else _long_cmd),
         "description": "执行数据库清理脚本时触发安全扫描（测试消息）",
         "session_id": "device-test-session-s11",
         "pattern_keys": ["tirith:destructive_command"],
@@ -1814,9 +1817,17 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
     # 若不处理，下面那行赋值会把旧流的对象直接丢掉，而旧流后续仍按 session_id
     # 动态查找 active_streams，于是写进【新流的对象】→ 内容交叉、seq 错乱。
     prev_stream = active_streams.get(session_id)
-    if prev_stream is not None and prev_stream.get("status") == "processing":
+    # ⚠️ 只对「正在推 token」的旧流做 superseded。
+    #   「等审批」的流同样处于 processing 且可能挂 300 秒，但那是**合法状态** ——
+    #   把它杀掉会导致用户稍后批准的结果被丢弃。真正需要防的是两条流同时推 token
+    #   互相覆盖对方的内容。
+    if (prev_stream is not None
+            and prev_stream.get("status") == "processing"
+            and not prev_stream.get("awaiting_approval", False)):
         prev_stream["status"] = "superseded"
-        print(f"[WS] session {session_id} 已有活跃流，旧的标记为 superseded", flush=True)
+        print(f"[WS] session {session_id} 已有活跃流（推流中），旧的标记为 superseded", flush=True)
+    elif prev_stream is not None and prev_stream.get("awaiting_approval", False):
+        print(f"[WS] session {session_id} 旧流正在等审批，不做 superseded（保留其结果）", flush=True)
 
     # 本次流的对象用**局部引用**贯穿始终（不再按 session_id 动态查找）
     my_stream = {"seq": 0, "tokens": [], "full_response": "", "status": "processing",
@@ -1918,6 +1929,9 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                         # Wait for approval resolution (proxy intercept or WebSocket).
                                         # Poll result flag instead of blocking on asyncio.Event to
                                         # avoid inter-task wakeup races on busy event loops.
+                                        # S12 修：标记本流进入"等审批"状态。
+                                        # 等审批期间它不应被同一 session 上的新请求 superseded。
+                                        my_stream["awaiting_approval"] = True
                                         _wait_start = time.monotonic()
                                         _approval_done = False
                                         while time.monotonic() - _wait_start < 300:
@@ -1927,6 +1941,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                                 choice = pending["result"]
                                                 break
                                             await asyncio.sleep(2.0)
+                                        my_stream["awaiting_approval"] = False
                                         if _approval_done:
                                             # POST choice back to Gateway (idempotent — Gateway handles duplicate)
                                             try:
