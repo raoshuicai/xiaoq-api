@@ -207,9 +207,91 @@ def list_files(request: Request, path: str = Query("", description="Obsidian 内
     }
 
 
+# ─────────────────── S17：md → HTML 渲染（带 mtime 缓存）───────────────────
+
+# 缓存：{相对路径: (mtime, size, html)}。
+# key 里带 mtime + size —— Vault 是活的（每天新增/编辑笔记），
+# 用「路径」单键会让改过的文件一直吐旧 HTML；带 mtime 则自动失效，无需任何同步机制。
+_MD_HTML_CACHE: dict = {}
+_MD_CACHE_MAX = 300          # 上限，防长跑进程内存无限增长（565 个文件，够用）
+
+# 阅读优化 CSS。
+# ⚠️ 设计要点：
+#   - 字号 16px / 行高 1.8：手机长文阅读的舒适区间（Vault 文档动辄几千字）
+#   - 表格 display:block + overflow-x:auto：**这是选 WebView 方案的主要原因**
+#     —— Vault 里 76% 的文档有表格，宽表必须能横向滑动而不是被压扁
+#   - user-select: text + -webkit-user-select: text：**显式开启文本选择**
+#     （部分 WebView 默认行为不一致，必须写死，否则用户长按选不中文字）
+#   - 代码块横向滚动、引用块左边条、图片 max-width:100% 防溢出
+_MD_CSS = """
+*{box-sizing:border-box;-webkit-user-select:text;user-select:text;-webkit-touch-callout:default}
+html,body{margin:0;padding:0}
+body{font-family:-apple-system,'HarmonyOS Sans',sans-serif;font-size:16px;line-height:1.8;
+     color:#1a1a2e;background:#ffffff;padding:14px 16px 40px;word-wrap:break-word;overflow-wrap:break-word}
+p{margin:0 0 14px}
+h1,h2,h3,h4,h5,h6{line-height:1.4;margin:24px 0 12px;font-weight:600}
+h1{font-size:23px;border-bottom:2px solid #eee;padding-bottom:8px}
+h2{font-size:20px;border-bottom:1px solid #f0f0f0;padding-bottom:6px}
+h3{font-size:18px}
+h4{font-size:16.5px}
+h5,h6{font-size:16px;color:#555}
+ul,ol{margin:0 0 14px;padding-left:24px}
+li{margin:5px 0}
+li>ul,li>ol{margin:5px 0}
+a{color:#5B5BD6;text-decoration:none}
+strong{font-weight:600}
+hr{border:none;border-top:1px solid #eee;margin:20px 0}
+blockquote{border-left:3px solid #d0d0dd;margin:14px 0;padding:6px 0 6px 14px;color:#5a5a6e;background:#fafafd}
+code{background:#f0f0f5;padding:2px 5px;border-radius:4px;font-size:14px;
+     font-family:'SF Mono',Consolas,monospace}
+pre{background:#f6f8fa;padding:12px 14px;border-radius:8px;overflow-x:auto;margin:0 0 14px;
+    border:1px solid #ececf2}
+pre code{background:none;padding:0;font-size:13.5px;line-height:1.6}
+table{border-collapse:collapse;display:block;overflow-x:auto;max-width:100%;margin:14px 0;
+      font-size:14px;-webkit-overflow-scrolling:touch}
+th,td{border:1px solid #e2e2ea;padding:7px 11px;text-align:left;white-space:nowrap}
+th{background:#f5f5fa;font-weight:600}
+tbody tr:nth-child(even){background:#fafafd}
+img{max-width:100%;height:auto;border-radius:6px}
+"""
+
+
+def _render_md_html(rel_path: str, full_path) -> str:
+    """md → 完整 HTML 文档（含内联 CSS）。带 mtime+size 缓存。"""
+    st = full_path.stat()
+    key = rel_path
+    hit = _MD_HTML_CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+
+    text = full_path.read_text(encoding="utf-8", errors="replace")
+    try:
+        import markdown_it
+        md = markdown_it.MarkdownIt("commonmark", {"html": True})
+        md.enable("table")          # Vault 大量使用 GFM 表格，默认 commonmark 不认
+        body = md.render(text)
+    except Exception as e:          # 渲染失败不能让整个阅读功能挂掉 → 退回纯文本
+        print(f"[MD] render failed, fallback to plain text: {e}", flush=True)
+        import html as _h
+        body = "<pre>" + _h.escape(text) + "</pre>"
+
+    html = ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=3'>"
+            "<style>" + _MD_CSS + "</style></head><body>" + body + "</body></html>")
+
+    if len(_MD_HTML_CACHE) >= _MD_CACHE_MAX:
+        _MD_HTML_CACHE.clear()      # 简单粗暴但够用：Vault 才 565 个文件
+    _MD_HTML_CACHE[key] = (st.st_mtime, st.st_size, html)
+    return html
+
+
 @app.get("/api/files/read")
-def read_file(request: Request, path: str = Query(..., description="文件相对路径")):
-    """读取文件内容（仅文本类文件）"""
+def read_file(
+    request: Request,
+    path: str = Query(..., description="文件相对路径"),
+    render: str = Query("text", description="text=原文 / html=md 渲染后的 HTML"),
+):
+    """读取文件内容（仅文本类文件）。render=html 时把 .md 渲染成适合手机阅读的 HTML。"""
     check_auth(request)
 
     full_path = (OBSIDIAN_VAULT / path).resolve()
@@ -230,12 +312,26 @@ def read_file(request: Request, path: str = Query(..., description="文件相对
     if ext not in READABLE_EXTENSIONS:
         raise HTTPException(status_code=415, detail=f"Unsupported file type: {ext}")
 
+    # render=html：把 md 渲染成带阅读优化 CSS 的 HTML（客户端 WebView 直接加载）
+    if render == "html" and ext == ".md":
+        # 同时带上原文 content：客户端「复制全文」需要纯文本，
+        # 让它为此再发一次请求不划算（而且那一次还得重新读盘）。
+        return {
+            "path": path,
+            "name": full_path.name,
+            "size": full_path.stat().st_size,
+            "html": _render_md_html(path, full_path),
+            "content": full_path.read_text(encoding="utf-8", errors="replace"),
+            "rendered": True,
+        }
+
     content = full_path.read_text(encoding="utf-8", errors="replace")
     return {
         "path": path,
         "name": full_path.name,
         "size": full_path.stat().st_size,
         "content": content,
+        "rendered": False,
     }
 
 
