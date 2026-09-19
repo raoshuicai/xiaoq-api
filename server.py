@@ -1666,6 +1666,21 @@ async def websocket_push(websocket: WebSocket):
                     session_id = "app-" + uuid.uuid4().hex[:16]
                     print(f"[WS] 新建会话 {session_id} (client={client_id})", flush=True)
                 print(f"[WS] 流式聊天 from {client_id}, session={session_id}, messages={len(messages)}", flush=True)
+
+                # S12 修：同一连接上同一会话已有活跃流 → 拒绝，不要双双送去 Gateway。
+                # 背景：Gateway 对同一 session 是串行的，后一条请求会读到前一条的响应，
+                # 造成回复内容交叉。若旧流属于**别的连接**（断线重连场景）则放行 ——
+                # 那种情况由 handler 里的 superseded 机制安全接管。
+                _cur = active_streams.get(session_id)
+                if (_cur is not None and _cur.get("status") == "processing"
+                        and _cur.get("ws") is websocket):
+                    print(f"[WS] 拒绝并发 chat（同一连接已有活跃流）session={session_id}", flush=True)
+                    await websocket.send_json({
+                        "type": "chat_error",
+                        "message": "上一条还在回复中，请等它说完再发",
+                    })
+                    continue
+
                 # 先回执，保证 APP 在第一个 token 之前就知道归属会话
                 await websocket.send_json({
                     "type": "chat_started",
@@ -1794,8 +1809,19 @@ async def websocket_push(websocket: WebSocket):
 
 async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id: str):
     """通过 Hermes API 流式处理聊天，结果通过 WebSocket 推送"""
-    # 注册活跃流（支持断点续传）
-    active_streams[session_id] = {"seq": 0, "tokens": [], "full_response": "", "status": "processing"}
+    # S12 修：同一 session 只允许一个活跃流。
+    # 断线重连时旧连接的 handler 可能仍在跑（await 未结束），新连接又发起一个 ——
+    # 若不处理，下面那行赋值会把旧流的对象直接丢掉，而旧流后续仍按 session_id
+    # 动态查找 active_streams，于是写进【新流的对象】→ 内容交叉、seq 错乱。
+    prev_stream = active_streams.get(session_id)
+    if prev_stream is not None and prev_stream.get("status") == "processing":
+        prev_stream["status"] = "superseded"
+        print(f"[WS] session {session_id} 已有活跃流，旧的标记为 superseded", flush=True)
+
+    # 本次流的对象用**局部引用**贯穿始终（不再按 session_id 动态查找）
+    my_stream = {"seq": 0, "tokens": [], "full_response": "", "status": "processing",
+                 "ws": websocket}
+    active_streams[session_id] = my_stream
     
     # 先发一个思考状态，告诉用户正在处理
     try:
@@ -1939,12 +1965,16 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                                 delta = choices[0].get("delta", {})
                                                 content = delta.get("content", "")
                                                 if content:
+                                                    # S12 修：被新流取代后立刻停手，避免污染对方的缓存
+                                                    if my_stream.get("status") != "processing":
+                                                        print(f"[WS] 流已被取代，停止处理 (session_id={session_id})", flush=True)
+                                                        break
                                                     has_tokens = True
                                                     full_response += content
-                                                    # 分配序列号
-                                                    seq = active_streams[session_id]["seq"]
-                                                    active_streams[session_id]["seq"] = seq + 1
-                                                    active_streams[session_id]["full_response"] = full_response
+                                                    # 分配序列号（全部走本次流的局部对象）
+                                                    seq = my_stream["seq"]
+                                                    my_stream["seq"] = seq + 1
+                                                    my_stream["full_response"] = full_response
                                                 
                                                     if client_connected:
                                                         try:
@@ -1960,8 +1990,8 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                                             client_connected = False
                                                     elif seq < 3:
                                                         print(f"[WS-PUSH] token #{seq} NOT pushed (client_connected=False)", flush=True)
-                                                    # 无论客户端是否连接，都缓存 token
-                                                    active_streams[session_id]["tokens"].append({
+                                                    # 无论客户端是否连接，都缓存 token（写入本次流的对象）
+                                                    my_stream["tokens"].append({
                                                         "seq": seq,
                                                         "content": content
                                                     })
@@ -1999,13 +2029,13 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                     pass
         
         # 标记完成，保留 token 缓冲供后续 sync_pending 查询
-        active_streams[session_id]["status"] = "complete"
-        active_streams[session_id]["completed_at"] = time.time()
+        my_stream["status"] = "complete"
+        my_stream["completed_at"] = time.time()
     except asyncio.TimeoutError:
         print(f"[WS] Chat stream timeout for {session_id}")
-        active_streams[session_id]["status"] = "timeout"
-        active_streams[session_id]["completed_at"] = time.time()
-        active_streams[session_id].pop("reconnect_ws", None)
+        my_stream["status"] = "timeout"
+        my_stream["completed_at"] = time.time()
+        my_stream.pop("reconnect_ws", None)
     except Exception as e:
         print(f"[WS] Chat stream error: {e}")
         if client_connected:
@@ -2013,9 +2043,9 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                 await websocket.send_json({"type": "chat_error", "message": str(e)})
             except Exception:
                 pass
-        active_streams[session_id]["status"] = "error"
-        active_streams[session_id]["completed_at"] = time.time()
-        active_streams[session_id].pop("reconnect_ws", None)
+        my_stream["status"] = "error"
+        my_stream["completed_at"] = time.time()
+        my_stream.pop("reconnect_ws", None)
 
 # 推送API (HTTP 触发 WebSocket 推送)
 @app.post("/api/push/ws")
