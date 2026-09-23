@@ -2598,6 +2598,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                     last_token_time = time.monotonic()
                     SSE_IDLE_TIMEOUT = 45  # 45秒无SSE数据则判定断流
                     ait = resp.aiter_bytes().__aiter__()
+                    _turn_tool_order: dict = {}   # S45-A2: toolCallId -> 本轮序号（整条流只初始化一次）
                     while True:
                         try:
                             chunk = await asyncio.wait_for(ait.__anext__(), timeout=SSE_IDLE_TIMEOUT)
@@ -2621,6 +2622,39 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                     event_type = line[7:].strip()
                                 elif line.startswith("data: "):
                                     data_line = line[6:].strip()
+                            # ── S45-A：工具进度（Milo: 让 APP 在长工具轮期间有反馈）──
+                            # Gateway v0.21.3 会把它作为**独立 SSE 帧**发出（不在 delta 里）：
+                            #   event: hermes.tool.progress
+                            #   data: {"tool":"terminal","label":"ls /tmp + 2 commands",
+                            #          "status":"running","toolCallId":"call_...","emoji":"💻"}
+                            # 字段名以实测为准（见 skill/V2 文档），不要用 name/input_summary。
+                            if event_type == "hermes.tool.progress" and data_line:
+                                try:
+                                    _tp = json.loads(data_line)
+                                    _cid = str(_tp.get("toolCallId", ""))
+                                    if _cid and _cid not in _turn_tool_order:
+                                        _turn_tool_order[_cid] = len(_turn_tool_order) + 1
+                                    _tp["index"] = _turn_tool_order.get(_cid, 0)
+                                    _tp["total"] = len(_turn_tool_order)
+                                    if client_connected:
+                                        _st = str(_tp.get("status"))
+                                        _tl = str(_tp.get("tool"))
+                                        _lb = str(_tp.get("label"))[:40]
+                                        print("[WS] 工具进度转发 status=" + _st + " tool=" + _tl + " label=" + _lb + " [" + str(_tp.get("index")) + "/" + str(_tp.get("total")) + "]", flush=True)
+                                        await websocket.send_json({
+                                            "type": "chat_progress",
+                                            "tool": _tp.get("tool", ""),
+                                            "label": _tp.get("label", ""),
+                                            # running / completed
+                                            "status": _tp.get("status", ""),
+                                            # 并发场景必需：同名工具的多个调用靠它区分
+                                            "toolCallId": _tp.get("toolCallId", ""),
+                                            "emoji": _tp.get("emoji", ""),
+                                            "index": _tp.get("index", 0),
+                                        })
+                                except Exception as _e:
+                                    print(f"[WS] tool.progress 转发失败: {_e}", flush=True)
+
                             # Handle approval.request events
                             if event_type == "approval.request" and data_line:
                                 try:
@@ -2705,6 +2739,15 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                 raw = data_line
                                 if raw == "[DONE]":
                                     if client_connected:
+                                        try:
+                                            # S45-A：先告诉 APP 清理工具进度状态
+                                            # （否则某条进度若没等到 completed，进度条会一直转）
+                                            await websocket.send_json({
+                                                "type": "chat_progress",
+                                                "status": "stream_end",
+                                            })
+                                        except Exception:
+                                            pass
                                         try:
                                             # S41：结束帧带上本轮指标（不新增帧类型，老客户端自动忽略）
                                             _metrics = _collect_turn_metrics(
