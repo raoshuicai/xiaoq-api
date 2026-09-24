@@ -2541,13 +2541,23 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
             and prev_stream.get("status") == "processing"
             and not prev_stream.get("awaiting_approval", False)):
         prev_stream["status"] = "superseded"
+        # 方案C：主动取消旧流的 task。只标记 superseded 是**不够的** ——
+        #   旧 handler 仍会继续消费 Gateway 的 SSE，占着同 session 的串行槽，
+        #   导致新请求的响应被抢走/混流。实测：APP 重启后旧 handler 发 17 次必失败。
+        _old_task = prev_stream.get("task")
+        if _old_task is not None and not _old_task.done():
+            _old_task.cancel()
+            print(f"[WS] session {session_id} 旧流 task 已取消（释放 Gateway 串行槽）", flush=True)
         print(f"[WS] session {session_id} 已有活跃流（推流中），旧的标记为 superseded", flush=True)
     elif prev_stream is not None and prev_stream.get("awaiting_approval", False):
         print(f"[WS] session {session_id} 旧流正在等审批，不做 superseded（保留其结果）", flush=True)
 
     # 本次流的对象用**局部引用**贯穿始终（不再按 session_id 动态查找）
+    # 方案C：记录本流所属的 asyncio task —— 新流据此可主动取消旧流，
+    #   释放 Gateway「同 session 串行」的槽位（否则旧流会一直占着，
+    #   新请求的响应可能被旧 handler 抢走/混流）。
     my_stream = {"seq": 0, "tokens": [], "full_response": "", "status": "processing",
-                 "ws": websocket}
+                 "ws": websocket, "task": asyncio.current_task()}
     active_streams[session_id] = my_stream
     
     # 先发一个思考状态，告诉用户正在处理
@@ -2570,7 +2580,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
     full_response = ""
     try:
         has_tokens = False
-        async with asyncio.timeout(300):  # 方案: 总超时5分钟
+        async with asyncio.timeout(3600):  # 硬上限1小时：只防死循环，不掐正常长任务
             async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream(
                     "POST",
@@ -2596,16 +2606,33 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
 
                     buffer = ""
                     last_token_time = time.monotonic()
-                    SSE_IDLE_TIMEOUT = 45  # 45秒无SSE数据则判定断流
+                    SSE_IDLE_TIMEOUT = 120  # 120秒无SSE数据判定断流（原45s对长思考/复杂工具偏紧）
                     ait = resp.aiter_bytes().__aiter__()
                     _turn_tool_order: dict = {}   # S45-A2: toolCallId -> 本轮序号（整条流只初始化一次）
                     while True:
+                        # 方案B：客户端一旦断开（任何一次 send 失败都会置 False），
+                        #   立即停止消费 Gateway 的 SSE —— 否则旧流会一直占着
+                        #   同 session 的串行槽，新请求的响应被抢走/混流。
+                        if not client_connected:
+                            print(f"[WS] client_connected=False，停止消费 SSE session={session_id}", flush=True)
+                            break
                         try:
                             chunk = await asyncio.wait_for(ait.__anext__(), timeout=SSE_IDLE_TIMEOUT)
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
                             print(f"[WS] SSE idle timeout ({SSE_IDLE_TIMEOUT}s) for {session_id}, caching current response")
+                            # 评审 REV-03：不能对客户端静默，否则用户要硬等 20s 停滞检测才发现流已断。
+                            #   ⚠️ 必须在置 client_connected=False **之前**发送，否则自己把自己挡住。
+                            #   ⚠️ 用字符串拼接（禁 f-string 嵌套引号 —— 曾导致服务每 5 秒崩溃重启）。
+                            if client_connected:
+                                try:
+                                    await websocket.send_json({
+                                        "type": "chat_error",
+                                        "message": "上游响应超时（超过 " + str(SSE_IDLE_TIMEOUT) + "s 无数据），已保存当前进度"
+                                    })
+                                except Exception:
+                                    pass
                             client_connected = False
                             break
                         last_token_time = time.monotonic()
@@ -2651,9 +2678,14 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             "toolCallId": _tp.get("toolCallId", ""),
                                             "emoji": _tp.get("emoji", ""),
                                             "index": _tp.get("index", 0),
+                                            # 评审 REV-04：跨会话隔离必需 —— 客户端据此丢弃非当前会话的进度
+                                            "session_id": session_id,
                                         })
                                 except Exception as _e:
-                                    print(f"[WS] tool.progress 转发失败: {_e}", flush=True)
+                                    # 方案B：发送失败 = 客户端已断开 → 置 False，
+                                    #   下一轮 SSE 循环顶部会 break 退出（见 B-1）。
+                                    print(f"[WS] tool.progress 转发失败: {_e} —— 标记断开，本轮流将终止", flush=True)
+                                    client_connected = False
 
                             # Handle approval.request events
                             if event_type == "approval.request" and data_line:
@@ -2745,6 +2777,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             await websocket.send_json({
                                                 "type": "chat_progress",
                                                 "status": "stream_end",
+                                                "session_id": session_id,
                                             })
                                         except Exception:
                                             pass
@@ -2838,6 +2871,14 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         # 标记完成，保留 token 缓冲供后续 sync_pending 查询
         my_stream["status"] = "complete"
         my_stream["completed_at"] = time.time()
+    except asyncio.CancelledError:
+        # 方案C 配套：本流被新流取消（见 C-2）。做清理后必须 re-raise，
+        #   否则 asyncio 会报 "task was destroyed but it is pending"。
+        print(f"[WS] 本轮流已被新流取代（task cancelled）session={session_id}", flush=True)
+        my_stream["status"] = "superseded"
+        my_stream["completed_at"] = time.time()
+        active_streams[session_id] = my_stream
+        raise
     except asyncio.TimeoutError:
         print(f"[WS] Chat stream timeout for {session_id}")
         my_stream["status"] = "timeout"
