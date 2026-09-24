@@ -2610,11 +2610,16 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                     ait = resp.aiter_bytes().__aiter__()
                     _turn_tool_order: dict = {}   # S45-A2: toolCallId -> 本轮序号（整条流只初始化一次）
                     while True:
-                        # 方案B：客户端一旦断开（任何一次 send 失败都会置 False），
-                        #   立即停止消费 Gateway 的 SSE —— 否则旧流会一直占着
-                        #   同 session 的串行槽，新请求的响应被抢走/混流。
-                        if not client_connected:
-                            print(f"[WS] client_connected=False，停止消费 SSE session={session_id}", flush=True)
+                        # 方案1（2026-09-24 修）：客户端断开**不再**终止上游消费。
+                        #   旧版（方案B）在这里 break = 主动关掉 Gateway 的上游请求，
+                        #   正在跑的工具会被 SIGINT（实测 exit_code=130）——
+                        #   退后台断一次连接就杀掉整轮任务，代价太大。
+                        #   现在断线后继续消费 SSE，token 照常进 my_stream 缓存
+                        #   （推不出去就不推），函数末尾统一写 offline_chats +
+                        #   Push 通知，回前台由 sync_pending 回放。
+                        #   只有本流已被取代/结束（superseded / timeout / error）才退出。
+                        if my_stream.get("status") != "processing":
+                            print("[WS] 流状态=" + str(my_stream.get("status")) + "，停止消费 SSE session=" + session_id, flush=True)
                             break
                         try:
                             chunk = await asyncio.wait_for(ait.__anext__(), timeout=SSE_IDLE_TIMEOUT)
@@ -2663,11 +2668,12 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                         _turn_tool_order[_cid] = len(_turn_tool_order) + 1
                                     _tp["index"] = _turn_tool_order.get(_cid, 0)
                                     _tp["total"] = len(_turn_tool_order)
+                                    # 方案1：进度日志无条件打（断线期间也要留痕，用来确认流仍在消费）
+                                    _st = str(_tp.get("status"))
+                                    _tl = str(_tp.get("tool"))
+                                    _lb = str(_tp.get("label"))[:40]
+                                    print("[WS] 工具进度" + ("转发" if client_connected else "（客户端已断开，仅记录）") + " status=" + _st + " tool=" + _tl + " label=" + _lb + " [" + str(_tp.get("index")) + "/" + str(_tp.get("total")) + "]", flush=True)
                                     if client_connected:
-                                        _st = str(_tp.get("status"))
-                                        _tl = str(_tp.get("tool"))
-                                        _lb = str(_tp.get("label"))[:40]
-                                        print("[WS] 工具进度转发 status=" + _st + " tool=" + _tl + " label=" + _lb + " [" + str(_tp.get("index")) + "/" + str(_tp.get("total")) + "]", flush=True)
                                         await websocket.send_json({
                                             "type": "chat_progress",
                                             "tool": _tp.get("tool", ""),
@@ -2682,9 +2688,9 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             "session_id": session_id,
                                         })
                                 except Exception as _e:
-                                    # 方案B：发送失败 = 客户端已断开 → 置 False，
-                                    #   下一轮 SSE 循环顶部会 break 退出（见 B-1）。
-                                    print(f"[WS] tool.progress 转发失败: {_e} —— 标记断开，本轮流将终止", flush=True)
+                                    # 方案1：发送失败只代表**这个 socket** 死了（客户端断开），
+                                    #   不再终止本轮 —— 循环顶部已不再因 client_connected 退出。
+                                    print(f"[WS] tool.progress 转发失败: {_e} —— 标记断开，本轮继续消费上游（方案1）", flush=True)
                                     client_connected = False
 
                             # Handle approval.request events
@@ -2692,7 +2698,10 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                 try:
                                     approval_evt = json.loads(data_line)
                                     run_id = approval_evt.get("run_id", "")
-                                    if client_connected and run_id:
+                                    # 方案1：注册与推送解耦 —— 断线也必须注册 pending，
+                                    #   否则 APP 回前台在「审批历史」里也找不到这张卡，
+                                    #   用户批了也没人接（proxy 拦截找不到 entry）。
+                                    if run_id:
                                         # Set up event so proxy/WebSocket handler can signal us
                                         approval_event = asyncio.Event()
                                         _pending_approvals[run_id] = {
@@ -2706,19 +2715,25 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             "created_at": time.time(),
                                             "expired": False,
                                         }
-                                        # Forward to APP
-                                        await websocket.send_json({
-                                            "type": "approve_request",
-                                            "run_id": run_id,
-                                            "command": approval_evt.get("command", ""),
-                                            # description：Gateway 给的触发上下文说明（S11 起 APP 会显示）
-                                            "description": approval_evt.get("description", ""),
-                                            "pattern_keys": approval_evt.get("pattern_keys", []),
-                                            "choices": approval_evt.get("choices", ["once", "session", "always", "deny"]),
-                                            # session_id：哪个会话触发的（S11 新增，便于 APP 显示上下文）
-                                            "session_id": session_id,
-                                        })
-                                        print(f"[WS] 审批请求已转发 (run={run_id[:12]}, session={session_id})")
+                                        # Forward to APP（方案1：断线时推送会失败 —— 不能让它上抛，
+                                        #   否则会落到外层 except Exception 把整轮判成 error。
+                                        #   pending 已注册，用户回前台从「审批历史」提交、
+                                        #   proxy 拦截照常唤醒下面的轮询循环 → 上游继续跑）
+                                        try:
+                                            await websocket.send_json({
+                                                "type": "approve_request",
+                                                "run_id": run_id,
+                                                "command": approval_evt.get("command", ""),
+                                                # description：Gateway 给的触发上下文说明（S11 起 APP 会显示）
+                                                "description": approval_evt.get("description", ""),
+                                                "pattern_keys": approval_evt.get("pattern_keys", []),
+                                                "choices": approval_evt.get("choices", ["once", "session", "always", "deny"]),
+                                                # session_id：哪个会话触发的（S11 新增，便于 APP 显示上下文）
+                                                "session_id": session_id,
+                                            })
+                                        except Exception as _pe:
+                                            print(f"[WS] 审批卡片推送失败（客户端已断开）: {_pe} (run={run_id[:12]})", flush=True)
+                                        print(f"[WS] 审批请求已注册 (run={run_id[:12]}, session={session_id}, pushed={client_connected})")
                                         # Wait for approval resolution (proxy intercept or WebSocket).
                                         # Poll result flag instead of blocking on asyncio.Event to
                                         # avoid inter-task wakeup races on busy event loops.
