@@ -879,6 +879,57 @@ def tokens_summary(request: Request):
 
 
 
+def _init_push_db():
+    """Ensure push DB exists with correct schema."""
+    db = sqlite3.connect(str(PUSH_DB))
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS push_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL,
+            source TEXT DEFAULT 'intel',
+            created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+            read_at TEXT
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS offline_chats (
+            session_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+        )
+    """)
+    db.commit()
+    db.close()
+
+_init_push_db()
+
+
+class PushEventManager:
+    """Simple SSE broadcaster for live push delivery."""
+    def __init__(self):
+        self._subscribers: list[asyncio.Queue] = []
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._subscribers.append(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        if q in self._subscribers:
+            self._subscribers.remove(q)
+
+    async def broadcast(self, message: dict):
+        payload = json.dumps(message, ensure_ascii=False)
+        for q in self._subscribers[:]:
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                pass
+
+push_events = PushEventManager()
+
+
 @app.post("/api/push")
 async def push_message(request: Request, background_tasks: BackgroundTasks):
     """Receive a push message (from cron jobs, Hermes, etc.)"""
