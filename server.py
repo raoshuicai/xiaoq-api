@@ -28,6 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 # ── Config ──────────────────────────────────────────────────────────
+SERVER_VERSION = "v1.0.0"   # 版本基线：2026-10-07，对应 commit bbe5f81（V4 修复方案起点）
 # ── Proxy Config ──────────────────────────────────────────────────────
 # 出站代理：用于访问外部 API（OpenRouter、华为 Push Kit 等）
 # 入站请求不受影响（FastAPI 本身不使用这些变量）
@@ -98,7 +99,7 @@ _approval_event_loop: asyncio.AbstractEventLoop | None = None
 # 取 30 分钟：足够用户在手机上滑出去再回来处理，又不至于无限堆积。
 _APPROVAL_KEEP_SECONDS: float = 1800.0
 
-app = FastAPI(title="小Q API", version="1.0.0")
+app = FastAPI(title="小Q API", version=SERVER_VERSION.lstrip("v"))
 
 app.add_middleware(
     CORSMiddleware,
