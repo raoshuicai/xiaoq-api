@@ -123,7 +123,7 @@ def check_auth(request: Request):
 # ── Health ───────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "xiaoq-api", "version": "1.0.0"}
+    return {"status": "ok", "service": "xiaoq-api", "version": SERVER_VERSION.lstrip("v")}
 
 
 # ── Scorer Names (射手中文名映射) ──────────────────────────────────
