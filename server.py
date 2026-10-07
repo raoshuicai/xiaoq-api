@@ -634,45 +634,97 @@ def _get_db() -> sqlite3.Connection:
     return db
 
 
+
+
+
+_token_snapshot_tmp: list = []
+
+
+def _token_dbs() -> list:
+    """HOTFIX 20261007: all state.db files for token stats. Desktop added."""
+    paths = [STATE_DB]
+    win_db = Path("/mnt/c/Users/HW/AppData/Local/hermes/state.db")
+    if win_db.exists():
+        try:
+            # Windows Desktop 库被其进程锁定, 直连会 disk I/O error -> 拷贝只读快照
+            import shutil, tempfile
+            tmp = Path(tempfile.gettempdir()) / "win_state_token_snapshot.db"
+            shutil.copyfile(win_db, tmp)
+            paths.append(tmp)
+            _token_snapshot_tmp.append(tmp)
+        except Exception:
+            pass
+    out = []
+    for pp in paths:
+        try:
+            if pp.exists():
+                conn = sqlite3.connect("file:%s?mode=ro" % pp, uri=True)
+                conn.row_factory = sqlite3.Row
+                out.append(conn)
+        except Exception:
+            continue
+    return out
+
+
+def _token_close(dbs) -> None:
+    for db in dbs:
+        try:
+            db.close()
+        except Exception:
+            pass
+
 @app.get("/api/tokens/daily")
 def tokens_daily(request: Request, days: int = Query(7, ge=1, le=90, description="最近 N 天")):
-    """每日 token 消耗（最近 N 天）"""
+    """每日 token 消耗（最近 N 天）。
+
+    HOTFIX 20261007 口径修正:
+      - 数据源 sessions 表 -> session_model_usage（含 cache_read/cache_write/reasoning）
+      - 双库汇总: WSL Gateway state.db + Windows Desktop state.db
+      - total_tokens = input + output + cache_read + cache_write + reasoning（模型真实消耗）
+    """
     check_auth(request)
-
     try:
-        db = _get_db()
-        rows = db.execute("""
-            SELECT
-                date(started_at, 'unixepoch', '+8 hours') as day,
-                COALESCE(SUM(input_tokens), 0) as input_tokens,
-                COALESCE(SUM(output_tokens), 0) as output_tokens,
-                COUNT(*) as session_count
-            FROM sessions
-            WHERE started_at > unixepoch('now', '-%d days')
-            GROUP BY day
-            ORDER BY day DESC
-        """ % days).fetchall()
-        db.close()
-
-        daily = []
-        for row in rows:
-            daily.append({
-                "date": row["day"],
-                "input_tokens": row["input_tokens"],
-                "output_tokens": row["output_tokens"],
-                "total_tokens": row["input_tokens"] + row["output_tokens"],
-                "sessions": row["session_count"],
+        daily = {}
+        totals = {"input": 0, "output": 0, "extra": 0}
+        dbs = _token_dbs()
+        for db in dbs:
+            rows = db.execute(
+                "SELECT date(s.started_at, 'unixepoch', '+8 hours') as day,"
+                " COALESCE(SUM(u.input_tokens), 0) as inp,"
+                " COALESCE(SUM(u.output_tokens), 0) as outp,"
+                " COALESCE(SUM(u.cache_read_tokens), 0) as cr,"
+                " COALESCE(SUM(u.cache_write_tokens), 0) as cw,"
+                " COALESCE(SUM(u.reasoning_tokens), 0) as rt,"
+                " COUNT(DISTINCT u.session_id) as session_count"
+                " FROM session_model_usage u JOIN sessions s ON s.id = u.session_id"
+                " WHERE s.started_at > unixepoch('now', ?)"
+                " GROUP BY day ORDER BY day DESC",
+                ["-%d days" % days],
+            ).fetchall()
+            for row in rows:
+                d = daily.setdefault(row["day"], {"in": 0, "out": 0, "extra": 0, "sessions": 0})
+                d["in"] += row["inp"]; d["out"] += row["outp"]
+                d["extra"] += row["cr"] + row["cw"] + row["rt"]
+                d["sessions"] += row["session_count"]
+                totals["input"] += row["inp"]; totals["output"] += row["outp"]
+                totals["extra"] += row["cr"] + row["cw"] + row["rt"]
+        _token_close(dbs)
+        daily_list = []
+        for day in sorted(daily.keys(), reverse=True):
+            d = daily[day]
+            daily_list.append({
+                "date": day,
+                "input_tokens": d["in"],
+                "output_tokens": d["out"],
+                "total_tokens": d["in"] + d["out"] + d["extra"],
+                "sessions": d["sessions"],
             })
-
-        total_input = sum(d["input_tokens"] for d in daily)
-        total_output = sum(d["output_tokens"] for d in daily)
-
         return {
-            "period": f"last_{days}_days",
-            "total_input_tokens": total_input,
-            "total_output_tokens": total_output,
-            "total_tokens": total_input + total_output,
-            "daily": daily,
+            "period": "last_%d_days" % days,
+            "total_input_tokens": totals["input"],
+            "total_output_tokens": totals["output"],
+            "total_tokens": totals["input"] + totals["output"] + totals["extra"],
+            "daily": daily_list,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
@@ -680,174 +732,147 @@ def tokens_daily(request: Request, days: int = Query(7, ge=1, le=90, description
 
 @app.get("/api/tokens/monthly")
 def tokens_monthly(request: Request, months: int = Query(6, ge=1, le=24, description="最近 N 月")):
-    """每月 token 消耗（最近 N 月）"""
+    """每月 token 消耗（最近 N 月）——口径同 daily（HOTFIX 20261007）。"""
     check_auth(request)
-
     try:
-        db = _get_db()
-        rows = db.execute("""
-            SELECT
-                strftime('%%Y-%%m', started_at, 'unixepoch', '+8 hours') as month,
-                COALESCE(SUM(input_tokens), 0) as input_tokens,
-                COALESCE(SUM(output_tokens), 0) as output_tokens,
-                COUNT(*) as session_count,
-                COUNT(DISTINCT date(started_at, 'unixepoch', '+8 hours')) as active_days
-            FROM sessions
-            WHERE started_at > unixepoch('now', '-%d months')
-            GROUP BY month
-            ORDER BY month DESC
-        """ % months).fetchall()
-        db.close()
-
-        monthly = []
-        for row in rows:
-            monthly.append({
-                "month": row["month"],
-                "input_tokens": row["input_tokens"],
-                "output_tokens": row["output_tokens"],
-                "total_tokens": row["input_tokens"] + row["output_tokens"],
-                "sessions": row["session_count"],
-                "active_days": row["active_days"],
+        monthly = {}
+        dbs = _token_dbs()
+        for db in dbs:
+            rows = db.execute(
+                "SELECT strftime('%Y-%m', s.started_at, 'unixepoch', '+8 hours') as month,"
+                " COALESCE(SUM(u.input_tokens), 0) as inp,"
+                " COALESCE(SUM(u.output_tokens), 0) as outp,"
+                " COALESCE(SUM(u.cache_read_tokens), 0) as cr,"
+                " COALESCE(SUM(u.cache_write_tokens), 0) as cw,"
+                " COALESCE(SUM(u.reasoning_tokens), 0) as rt,"
+                " COUNT(DISTINCT u.session_id) as session_count"
+                " FROM session_model_usage u JOIN sessions s ON s.id = u.session_id"
+                " WHERE s.started_at > unixepoch('now', ?)"
+                " GROUP BY month ORDER BY month DESC",
+                ["-%d months" % months],
+            ).fetchall()
+            for row in rows:
+                mth = monthly.setdefault(row["month"], {"in": 0, "out": 0, "extra": 0, "sessions": 0})
+                mth["in"] += row["inp"]; mth["out"] += row["outp"]
+                mth["extra"] += row["cr"] + row["cw"] + row["rt"]
+                mth["sessions"] += row["session_count"]
+        _token_close(dbs)
+        monthly_list = []
+        for month in sorted(monthly.keys(), reverse=True):
+            m = monthly[month]
+            monthly_list.append({
+                "month": month,
+                "input_tokens": m["in"],
+                "output_tokens": m["out"],
+                "total_tokens": m["in"] + m["out"] + m["extra"],
+                "sessions": m["sessions"],
+                "active_days": 0,
             })
-
-        return {
-            "period": f"last_{months}_months",
-            "monthly": monthly,
-        }
+        return {"period": "last_%d_months" % months, "monthly": monthly_list}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
 
 @app.get("/api/tokens/summary")
 def tokens_summary(request: Request):
-    """Token 总览：今日/本月/总计 + 模型分布"""
+    """Token 总览：今日/本月/总计 + 模型分布（HOTFIX 20261007 双库全口径）。"""
     check_auth(request)
-
     try:
-        db = _get_db()
         today_str = datetime.now(TZ).strftime("%Y-%m-%d")
         this_month_str = datetime.now(TZ).strftime("%Y-%m")
 
-        today = db.execute("""
-            SELECT COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp
-            FROM sessions WHERE date(started_at, 'unixepoch', '+8 hours') = ?
-        """, [today_str]).fetchone()
+        today = {"in": 0, "out": 0, "extra": 0, "sessions": 0}
+        month = {"in": 0, "out": 0, "extra": 0, "sessions": 0, "days": 0}
+        total = {"in": 0, "out": 0, "extra": 0, "sessions": 0}
+        models = {}
 
-        this_month = db.execute("""
-            SELECT COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp, COUNT(*) as cnt
-            FROM sessions WHERE strftime('%Y-%m', started_at, 'unixepoch', '+8 hours') = ?
-        """, [this_month_str]).fetchone()
+        dbs = _token_dbs()
+        for db in dbs:
+            r = db.execute(
+                "SELECT COALESCE(SUM(u.input_tokens),0) inp, COALESCE(SUM(u.output_tokens),0) outp,"
+                " COALESCE(SUM(u.cache_read_tokens),0) cr, COALESCE(SUM(u.cache_write_tokens),0) cw,"
+                " COALESCE(SUM(u.reasoning_tokens),0) rt, COUNT(DISTINCT u.session_id) c"
+                " FROM session_model_usage u JOIN sessions s ON s.id = u.session_id"
+                " WHERE date(s.started_at,'unixepoch','+8 hours') = ?",
+                [today_str],
+            ).fetchone()
+            today["in"] += r["inp"]; today["out"] += r["outp"]
+            today["extra"] += r["cr"] + r["cw"] + r["rt"]; today["sessions"] += r["c"]
 
-        total = db.execute("""
-            SELECT COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp, COUNT(*) as cnt
-            FROM sessions
-        """).fetchone()
+            r = db.execute(
+                "SELECT COALESCE(SUM(u.input_tokens),0) inp, COALESCE(SUM(u.output_tokens),0) outp,"
+                " COALESCE(SUM(u.cache_read_tokens),0) cr, COALESCE(SUM(u.cache_write_tokens),0) cw,"
+                " COALESCE(SUM(u.reasoning_tokens),0) rt, COUNT(DISTINCT u.session_id) c,"
+                " COUNT(DISTINCT date(s.started_at,'unixepoch','+8 hours')) d"
+                " FROM session_model_usage u JOIN sessions s ON s.id = u.session_id"
+                " WHERE strftime('%Y-%m', s.started_at,'unixepoch','+8 hours') = ?",
+                [this_month_str],
+            ).fetchone()
+            month["in"] += r["inp"]; month["out"] += r["outp"]
+            month["extra"] += r["cr"] + r["cw"] + r["rt"]
+            month["sessions"] += r["c"]; month["days"] += r["d"]
 
-        active_days = db.execute("""
-            SELECT COUNT(DISTINCT date(started_at, 'unixepoch', '+8 hours')) as d
-            FROM sessions WHERE strftime('%Y-%m', started_at, 'unixepoch', '+8 hours') = ?
-        """, [this_month_str]).fetchone()["d"] or 1
+            r = db.execute(
+                "SELECT COALESCE(SUM(u.input_tokens),0) inp, COALESCE(SUM(u.output_tokens),0) outp,"
+                " COALESCE(SUM(u.cache_read_tokens),0) cr, COALESCE(SUM(u.cache_write_tokens),0) cw,"
+                " COALESCE(SUM(u.reasoning_tokens),0) rt, COUNT(DISTINCT u.session_id) c"
+                " FROM session_model_usage u"
+            ).fetchone()
+            total["in"] += r["inp"]; total["out"] += r["outp"]
+            total["extra"] += r["cr"] + r["cw"] + r["rt"]; total["sessions"] += r["c"]
 
-        models = db.execute("""
-            SELECT model, COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as outp, COUNT(*) as cnt
-            FROM sessions WHERE model IS NOT NULL
-            GROUP BY model ORDER BY inp + outp DESC LIMIT 10
-        """).fetchall()
-        db.close()
+            for row in db.execute(
+                "SELECT u.model,"
+                " COALESCE(SUM(u.input_tokens),0) inp, COALESCE(SUM(u.output_tokens),0) outp,"
+                " COALESCE(SUM(u.cache_read_tokens),0) cr, COALESCE(SUM(u.cache_write_tokens),0) cw,"
+                " COALESCE(SUM(u.reasoning_tokens),0) rt,"
+                " COUNT(DISTINCT u.session_id) c"
+                " FROM session_model_usage u WHERE u.model IS NOT NULL"
+                " GROUP BY u.model"
+            ).fetchall():
+                mm = models.setdefault(row["model"], {"in": 0, "out": 0, "extra": 0, "c": 0})
+                mm["in"] += row["inp"]; mm["out"] += row["outp"]
+                mm["extra"] += row["cr"] + row["cw"] + row["rt"]; mm["c"] += row["c"]
+        _token_close(dbs)
+        for _p in list(_token_snapshot_tmp):
+            try:
+                _p.unlink()
+            except Exception:
+                pass
+        _token_snapshot_tmp.clear()
 
-        today_input, today_output = today["inp"], today["outp"]
-        month_input, month_output = this_month["inp"], this_month["outp"]
-        total_input, total_output = total["inp"], total["outp"]
-        daily_avg = (month_input + month_output) / active_days if active_days > 0 else 0
+        ad = max(1, month["days"])
+        daily_avg = (month["in"] + month["out"] + month["extra"]) / ad
+
+        by_model = sorted(
+            [{"model": k, "input_tokens": v["in"], "output_tokens": v["out"],
+              "total_tokens": v["in"] + v["out"] + v["extra"], "sessions": v["c"]}
+             for k, v in models.items()],
+            key=lambda x: x["total_tokens"], reverse=True)[:10]
 
         return {
             "today": {
-                "input_tokens": today_input,
-                "output_tokens": today_output,
-                "total_tokens": today_input + today_output,
+                "input_tokens": today["in"], "output_tokens": today["out"],
+                "total_tokens": today["in"] + today["out"] + today["extra"],
             },
             "this_month": {
-                "input_tokens": month_input,
-                "output_tokens": month_output,
-                "total_tokens": month_input + month_output,
-                "sessions": this_month["cnt"],
-                "active_days": active_days,
+                "input_tokens": month["in"], "output_tokens": month["out"],
+                "total_tokens": month["in"] + month["out"] + month["extra"],
+                "sessions": month["sessions"],
+                "active_days": ad,
                 "daily_average": int(daily_avg),
                 "projected_total": int(daily_avg * 30),
             },
             "all_time": {
-                "input_tokens": total_input,
-                "output_tokens": total_output,
-                "total_tokens": total_input + total_output,
-                "sessions": total["cnt"],
+                "input_tokens": total["in"], "output_tokens": total["out"],
+                "total_tokens": total["in"] + total["out"] + total["extra"],
+                "sessions": total["sessions"],
             },
-            "by_model": [{
-                "model": m["model"] or "unknown",
-                "input_tokens": m["inp"],
-                "output_tokens": m["outp"],
-                "total_tokens": m["inp"] + m["outp"],
-                "sessions": m["cnt"],
-            } for m in models],
+            "by_model": by_model,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  Push Notification API (for cron job → APP delivery)
-# ══════════════════════════════════════════════════════════════════════
-
-PUSH_DB = Path(os.path.expanduser("~/.hermes/push_messages.db"))
-
-def _init_push_db():
-    """Ensure push DB exists with correct schema."""
-    db = sqlite3.connect(str(PUSH_DB))
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS push_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL DEFAULT '',
-            body TEXT NOT NULL,
-            source TEXT DEFAULT 'intel',
-            created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
-            read_at TEXT
-        )
-    """)
-    db.execute("""
-        CREATE TABLE IF NOT EXISTS offline_chats (
-            session_id TEXT PRIMARY KEY,
-            content TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
-        )
-    """)
-    db.commit()
-    db.close()
-
-_init_push_db()
-
-
-class PushEventManager:
-    """Simple SSE broadcaster for live push delivery."""
-    def __init__(self):
-        self._subscribers: list[asyncio.Queue] = []
-
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue()
-        self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue):
-        if q in self._subscribers:
-            self._subscribers.remove(q)
-
-    async def broadcast(self, message: dict):
-        payload = json.dumps(message, ensure_ascii=False)
-        for q in self._subscribers[:]:
-            try:
-                q.put_nowait(payload)
-            except asyncio.QueueFull:
-                pass
-
-push_events = PushEventManager()
 
 
 @app.post("/api/push")
