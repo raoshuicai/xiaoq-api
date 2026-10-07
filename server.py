@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 # ── Config ──────────────────────────────────────────────────────────
-SERVER_VERSION = "v1.0.0"   # 版本基线：2026-10-07，对应 commit bbe5f81（V4 修复方案起点）
+SERVER_VERSION = "v1.0.1"   # V4 四bug修复：幂等模块/粘性计数/帧session_id/status拆档（S1-S15）
 # ── Proxy Config ──────────────────────────────────────────────────────
 # 出站代理：用于访问外部 API（OpenRouter、华为 Push Kit 等）
 # 入站请求不受影响（FastAPI 本身不使用这些变量）
@@ -1395,6 +1395,239 @@ def _clear_offline_cache(session_id: str) -> int:
         return 0
 
 
+def _normalize_content(s: str) -> str:
+    """V4-S9：内容归一（去首尾空白）。用于缓存/历史比对，两边同样处理。"""
+    return (s or "").strip()
+
+
+def _clear_offline_cache_if_delivered(session_id: str, items: list) -> int:
+    """
+    V4-S9：内容级确认后才清缓存（防「拉过历史就清」误删未送达的新回复）。
+    判据要点（修 V2「模板前缀假送达」）：
+      ① 只比 role == 'assistant' 的项
+      ② 只比【最后一条】assistant（防历史里旧回复的同前缀误命中）
+      ③ 长度接近（abs(len(a) - len(cached)) < 20）—— 同一回复的不同阶段
+      ④ >= 80 字符 → 前缀匹配；< 80 → strip() 后全等
+      ⑤ 两边做同样 normalize
+    ⚠️ 本函数在 FastAPI 线程池执行（session_messages 是同步 def），
+      与 WS handler 并发访问 PUSH_DB → 必须显式 timeout，
+      异常一律收敛为「保留缓存」（fail-safe：宁可重复投递也不丢回复）。
+    """
+    try:
+        db = sqlite3.connect(str(PUSH_DB), timeout=5)
+        try:
+            row = db.execute(
+                "SELECT content FROM offline_chats WHERE session_id = ?",
+                (session_id,)).fetchone()
+            if not row:
+                return 0
+            cached = _normalize_content(row[0] or "")
+            if not cached:
+                return 0
+            # ② 只取最后一条 assistant
+            last_a = ""
+            for it in items:
+                if (it.get("role") or "") == "assistant":
+                    last_a = _normalize_content(str(it.get("content") or ""))
+            delivered = False
+            if last_a:
+                # ③ 长度接近
+                if abs(len(last_a) - len(cached)) < 20:
+                    if len(cached) >= 80:
+                        delivered = cached[:80] in last_a  # ④ 前缀
+                    else:
+                        delivered = (cached == last_a)     # ④ 全等
+            if not delivered:
+                # 未确认送达 → 保留缓存
+                return 0
+            cur = db.execute("DELETE FROM offline_chats WHERE session_id = ?",
+                             (session_id,))
+            db.commit()
+            n = cur.rowcount
+            if n:
+                print(f"[Offline] cleared {n} cache row(s) after content-level confirm for {session_id}",
+                      flush=True)
+            return n
+        finally:
+            db.close()
+    except Exception as e:
+        # fail-safe：比对/DB 出错一律保留缓存
+        print(f"[Offline] content-level clear skipped for {session_id}: {e}", flush=True)
+        return 0
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  V4-S12：chat 幂等模块（借鉴 Gateway api_server_run_idempotency.py）
+#  保留：scope+key 主键 / fingerprint 冲突分类 / status_json / 双保留期
+#        / BEGIN IMMEDIATE 原子 reserve / 只 prune 终态行
+#  省略：owner_pid / owner_started（单进程，用启动清扫 idem_recover_orphans 替代）
+# ══════════════════════════════════════════════════════════════════════
+import hmac
+import hashlib
+
+_IDEM_TERMINAL = {"complete", "error", "superseded"}
+IDEM_RETENTION = 1800          # 终态保留 30 分钟
+IDEM_STALE_PROCESSING = 600    # processing 超 10 分钟视为孤儿（N2 超时放行）
+
+
+def _idem_conn():
+    return sqlite3.connect(str(PUSH_DB), timeout=5)
+
+
+def _chat_fingerprint(session_id: str, messages: list) -> str:
+    """fingerprint：同 key 不同内容 = conflict（不复用不误杀）。"""
+    last_user = {}
+    for m in reversed(messages):
+        if (m.get("role") or "") == "user":
+            last_user = m
+            break
+    payload = (session_id or "") + "|" + str(len(messages)) + "|" + str(last_user.get("content", ""))[:200]
+    return hmac.new(b"chat-idem", payload.encode("utf-8", "replace"), hashlib.sha256).hexdigest()
+
+
+def _idem_prune_locked(db, now: float):
+    """只删终态且过保留期的行（processing 行永不被 prune —— 照 Gateway）。"""
+    rows = db.execute(
+        "SELECT idempotency_key, status_json, retention_until, updated_at"
+        " FROM chat_idempotency WHERE scope='chat'").fetchall()
+    for key, sj, rt, up in rows:
+        try:
+            terminal = json.loads(sj).get("status") in _IDEM_TERMINAL
+        except Exception:
+            terminal = False
+        if not terminal:
+            continue
+        if (rt and rt <= now) or (not rt and up < now - IDEM_RETENTION):
+            db.execute("DELETE FROM chat_idempotency WHERE scope='chat' AND idempotency_key=?", (key,))
+
+
+def idem_reserve(key: str, fingerprint: str, run_id: str, status: str = "processing"):
+    """原子预留（BEGIN IMMEDIATE）。返回 (created|reused|conflict, record)。"""
+    now = time.time()
+    db = _idem_conn()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        _idem_prune_locked(db, now)
+        row = db.execute(
+            "SELECT fingerprint, status_json FROM chat_idempotency"
+            " WHERE scope='chat' AND idempotency_key=?", (key,)).fetchone()
+        if row is not None:
+            db.commit()
+            outcome = "reused" if hmac.compare_digest(row[0], fingerprint) else "conflict"
+            return outcome, json.loads(row[1])
+        encoded = json.dumps({"status": status}, ensure_ascii=False)
+        db.execute(
+            "INSERT INTO chat_idempotency(scope,idempotency_key,fingerprint,run_id,status_json,"
+            "retention_until,created_at,updated_at) VALUES('chat',?,?,?,?,0,?,?)",
+            (key, fingerprint, run_id, encoded, now, now))
+        db.commit()
+        return "created", {"status": status}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def idem_lookup(key: str, fingerprint: str):
+    """返回 (missing|reused|conflict|stale, record)。stale = 孤儿 processing（N2 超时放行）。"""
+    db = _idem_conn()
+    try:
+        row = db.execute(
+            "SELECT fingerprint, status_json, updated_at FROM chat_idempotency"
+            " WHERE scope='chat' AND idempotency_key=?", (key,)).fetchone()
+    finally:
+        db.close()
+    if row is None:
+        return "missing", None
+    outcome = "reused" if hmac.compare_digest(row[0], fingerprint) else "conflict"
+    try:
+        rec = json.loads(row[1])
+    except Exception:
+        rec = {"status": "error"}
+    if rec.get("status") == "processing" and time.time() - (row[2] or 0) > IDEM_STALE_PROCESSING:
+        return "stale", rec
+    return outcome, rec
+
+
+def idem_delete_stale(key: str):
+    """stale 行放行前删掉（否则 reserve 主键冲突）。"""
+    db = _idem_conn()
+    try:
+        db.execute("DELETE FROM chat_idempotency WHERE scope='chat' AND idempotency_key=?", (key,))
+        db.commit()
+    finally:
+        db.close()
+
+
+def idem_update_status(key: str, status: dict):
+    """终态更新：写 status_json + 启用保留期（照 Gateway update_status）。"""
+    db = _idem_conn()
+    try:
+        now = time.time()
+        db.execute(
+            "UPDATE chat_idempotency SET status_json=?, updated_at=? WHERE"
+            " scope='chat' AND idempotency_key=?",
+            (json.dumps(status, ensure_ascii=False), now, key))
+        if (status.get("status") or "") in _IDEM_TERMINAL:
+            db.execute(
+                "UPDATE chat_idempotency SET retention_until=? WHERE"
+                " scope='chat' AND idempotency_key=?",
+                (now + IDEM_RETENTION, key))
+        db.commit()
+    finally:
+        db.close()
+
+
+def idem_recover_orphans():
+    """★ N2 启动清扫：进程死亡后 processing 行必死 → 全部刷成 error（可重发）。
+    在 startup 事件里调用。"""
+    db = _idem_conn()
+    try:
+        rows = db.execute(
+            "SELECT idempotency_key, status_json FROM chat_idempotency"
+            " WHERE scope='chat'").fetchall()
+        n = 0
+        now = time.time()
+        for key, sj in rows:
+            try:
+                if json.loads(sj).get("status") == "processing":
+                    db.execute(
+                        "UPDATE chat_idempotency SET status_json=?, updated_at=?,"
+                        " retention_until=? WHERE scope='chat' AND idempotency_key=?",
+                        (json.dumps({"status": "error"}), now, now + IDEM_RETENTION, key))
+                    n += 1
+            except Exception:
+                continue
+        db.commit()
+        if n:
+            print(f"[Idem] 启动清扫：恢复孤儿 processing 行 {n} 条 → error", flush=True)
+    finally:
+        db.close()
+
+
+def _idem_ensure_table():
+    """幂等表建表（幂等，startup 调）。"""
+    db = _idem_conn()
+    try:
+        db.execute(
+            """CREATE TABLE IF NOT EXISTS chat_idempotency (
+                scope           TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                fingerprint     TEXT NOT NULL,
+                run_id          TEXT NOT NULL,
+                status_json     TEXT NOT NULL,
+                retention_until REAL NOT NULL DEFAULT 0,
+                acknowledged_at REAL,
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL,
+                PRIMARY KEY (scope, idempotency_key)
+            )""")
+        db.commit()
+    finally:
+        db.close()
+
+
 @app.get("/api/sessions/{session_id}/messages")
 def session_messages(
     session_id: str,
@@ -1445,8 +1678,9 @@ def session_messages(
             })
         # S19：历史已送达 → 清掉该会话的离线缓存，避免后续 sync_pending 重复投递同一份内容
         # （只在 offset=0 时清：分页翻更早的历史不该动缓存）
+        # V4-S8：改传 items 做内容级确认（S9），不再「拉过历史就清」
         if offset == 0:
-            _clear_offline_cache(session_id)
+            _clear_offline_cache_if_delivered(session_id, items)
         return {
             "items": items,
             "total": total,
@@ -2148,14 +2382,19 @@ class ConnectionManager:
             if websocket is None or current is websocket:
                 self.active_connections.pop(client_id, None)
 
-    async def push(self, client_id: str, message: dict):
+    async def push(self, client_id: str, message: dict) -> bool:
+        # V4-S3: 返回 True=送达当前连接；False=无连接或发送失败（调用方计数 push_failures）
         async with self.lock:
             ws = self.active_connections.get(client_id)
         if ws:
             try:
                 await ws.send_json(message)
+                return True
             except Exception:
+                # 传捕获到的 ws（不能重读字典，否则会误摘重连后的新连接）
                 await self.disconnect(client_id, ws)
+                return False
+        return False
 
     async def broadcast(self, message: dict):
         async with self.lock:
@@ -2272,26 +2511,73 @@ async def websocket_push(websocket: WebSocket):
                     print(f"[WS] 新建会话 {session_id} (client={client_id})", flush=True)
                 print(f"[WS] 流式聊天 from {client_id}, session={session_id}, messages={len(messages)}", flush=True)
 
-                # S12 修：同一连接上同一会话已有活跃流 → 拒绝，不要双双送去 Gateway。
-                # 背景：Gateway 对同一 session 是串行的，后一条请求会读到前一条的响应，
-                # 造成回复内容交叉。若旧流属于**别的连接**（断线重连场景）则放行 ——
-                # 那种情况由 handler 里的 superseded 机制安全接管。
-                _cur = active_streams.get(session_id)
-                if (_cur is not None and _cur.get("status") == "processing"
-                        and _cur.get("ws") is websocket):
-                    print(f"[WS] 拒绝并发 chat（同一连接已有活跃流）session={session_id}", flush=True)
-                    await websocket.send_json({
-                        "type": "chat_error",
-                        "message": "上一条还在回复中，请等它说完再发",
-                    })
-                    continue
+                # V4-S13: 双轨防护（N4）——有 client_msg_id 走幂等表（跨连接/重启都拦得住）；
+                #   老 APP 无该字段 → 保留原「同一连接防重复」防护（灰度期不裸奔）。
+                client_msg_id = str(data.get("client_msg_id") or "").strip()
+                if client_msg_id:
+                    _fp = _chat_fingerprint(session_id, messages)
+                    _outcome, _prev = idem_lookup(client_msg_id, _fp)
+                    if _outcome == "conflict":
+                        print(f"[WS] 幂等 conflict（同 id 不同内容）key={client_msg_id}", flush=True)
+                        await websocket.send_json({
+                            "type": "chat_error",
+                            "session_id": session_id,
+                            "message": "消息内容与ID不匹配，请重新发送",
+                        })
+                        continue
+                    if _outcome == "reused":
+                        _st = (_prev or {}).get("status")
+                        if _st == "processing":
+                            print(f"[WS] 幂等拒绝（processing 中）key={client_msg_id}", flush=True)
+                            await websocket.send_json({
+                                "type": "chat_error",
+                                "session_id": session_id,
+                                "message": "上一条还在回复中，请等它说完再发",
+                            })
+                            continue
+                        # reused + 终态：告知已处理，不重复执行（内容补推本轮不做）
+                        print(f"[WS] 幂等命中终态（不重跑）key={client_msg_id} status={_st}", flush=True)
+                        await websocket.send_json({
+                            "type": "chat_started",
+                            "session_id": session_id,
+                            "duplicate": True,
+                        })
+                        continue
+                    # missing 或 stale（N2 超时放行）→ 抢锁
+                    if _outcome == "stale":
+                        idem_delete_stale(client_msg_id)
+                    _res, _ = idem_reserve(client_msg_id, _fp,
+                                           run_id=session_id or client_msg_id)
+                    if _res == "reused":
+                        await websocket.send_json({
+                            "type": "chat_error",
+                            "session_id": session_id,
+                            "message": "该消息正在处理中",
+                        })
+                        continue
+                else:
+                    # S12 修（保留）：同一连接上同一会话已有活跃流 → 拒绝，不要双双送去 Gateway。
+                    # 背景：Gateway 对同一 session 是串行的，后一条请求会读到前一条的响应，
+                    # 造成回复内容交叉。若旧流属于**别的连接**（断线重连场景）则放行 ——
+                    # 那种情况由 handler 里的 superseded 机制安全接管。
+                    _cur = active_streams.get(session_id)
+                    if (_cur is not None and _cur.get("status") == "processing"
+                            and _cur.get("ws") is websocket):
+                        print(f"[WS] 拒绝并发 chat（同一连接已有活跃流）session={session_id}", flush=True)
+                        await websocket.send_json({
+                            "type": "chat_error",
+                            "session_id": session_id,
+                            "message": "上一条还在回复中，请等它说完再发",
+                        })
+                        continue
 
                 # 先回执，保证 APP 在第一个 token 之前就知道归属会话
                 await websocket.send_json({
                     "type": "chat_started",
                     "session_id": session_id,
                 })
-                await _chat_stream_handler(websocket, messages, session_id, req_model)
+                await _chat_stream_handler(client_id, websocket, messages, session_id, req_model,
+                                           client_msg_id)
             # 同步挂起缓存的消息回复（支持断点续流）
             elif data.get("type") == "sync_pending":
                 session_id = data.get("session_id")
@@ -2300,7 +2586,13 @@ async def websocket_push(websocket: WebSocket):
                     try:
                         # 优先检查活跃流（仍在处理中或刚完成的断点续传）
                         stream = active_streams.get(session_id)
-                        if stream is not None and not stream["tokens"]:
+                        _st = stream.get("status") if stream is not None else None
+                        # V4-S10: 按 my_stream["status"] 拆档。
+                        #   processing       → 续等（无 token）/ 续传（有 token）
+                        #   complete         → 回放 + chat_done + 写缓存（内容完整）
+                        #   superseded/error/timeout/无流 → 只走 offline_chats 兜底或 stream_missing，
+                        #     绝不回放半截 token / 不写缓存（M4：半截回复污染）
+                        if stream is not None and _st == "processing" and not stream["tokens"]:
                             # 流已注册但还没有 token（刚起步/上游还在思考）。
                             # 此处绝不能 fallback 到 offline_chats —— 那张表以
                             # session_id(= device_id) 为主键，同一设备共用一条记录，
@@ -2311,7 +2603,7 @@ async def websocket_push(websocket: WebSocket):
                                 "content": "",
                             })
                             print(f"[Resume] Stream registered but no tokens yet for {session_id}")
-                        elif stream and stream["tokens"]:
+                        elif stream and stream["tokens"] and _st in ("processing", "complete"):
                             # 使用服务端记录的已同步序列号防止重复推送（sync retry 会带相同的 last_seq）
                             stream.setdefault("last_synced_seq", -1)
                             effective_seq = max(last_seq, stream["last_synced_seq"])
@@ -2320,6 +2612,7 @@ async def websocket_push(websocket: WebSocket):
                             for t in missed:
                                 await websocket.send_json({
                                     "type": "chat_token",
+                                    "session_id": session_id,
                                     "seq": t["seq"],
                                     "content": t["content"],
                                 })
@@ -2341,13 +2634,13 @@ async def websocket_push(websocket: WebSocket):
                                 print(f"[Resume] Stream still active for {session_id}, replayed {len(missed)} tokens")
                             else:
                                 # 已完成 → 发送结束标记
-                                await websocket.send_json({"type": "chat_done"})
+                                await websocket.send_json({"type": "chat_done", "session_id": session_id})
                                 # 同时写入离线缓存（完整回复）
                                 if stream["full_response"]:
                                     db = sqlite3.connect(str(PUSH_DB))
                                     db.execute(
-                                        "INSERT OR REPLACE INTO offline_chats (session_id, content) VALUES (?, ?)",
-                                        (session_id, stream["full_response"])
+                                        "INSERT OR REPLACE INTO offline_chats (session_id, content, retention_until) VALUES (?, ?, ?)",
+                                        (session_id, stream["full_response"], time.time() + 600)
                                     )
                                     db.commit()
                                     db.close()
@@ -2519,8 +2812,8 @@ def _collect_turn_metrics(session_id: str, ttft_ms, started_wall: float) -> dict
     return m
 
 
-async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id: str,
-                               model: str = ""):
+async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: list, session_id: str,
+                               model: str = "", client_msg_id: str = ""):
     """通过 Hermes API 流式处理聊天，结果通过 WebSocket 推送
 
     `model` = APP 侧选中的模型别名（来自 /api/models 的 id）。
@@ -2563,7 +2856,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
     
     # 先发一个思考状态，告诉用户正在处理
     try:
-        await websocket.send_json({"type": "chat_thinking"})
+        await websocket.send_json({"type": "chat_thinking", "session_id": session_id})
     except Exception:
         pass
 
@@ -2579,6 +2872,24 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
     }
     client_connected = True
     full_response = ""
+    # V4-S1: 粘性失败计数 + 成功帧计数（S2 末尾判据用）
+    push_failures = 0
+    push_frames = 0
+
+    async def _push(frame: dict) -> bool:
+        """V4-S4: 统一走 manager.push（按 client_id 寻址 = S11 动态推送目标），并计数。
+        粘性语义：push_failures 只增不减；任一帧失败即客户端未在线到流结束 → 末尾写离线缓存。"""
+        nonlocal push_failures, push_frames, client_connected
+        try:
+            ok = await manager.push(client_id, frame)
+        except Exception:
+            ok = False
+        if ok:
+            push_frames += 1
+        else:
+            push_failures += 1
+            client_connected = False
+        return ok
     try:
         has_tokens = False
         async with asyncio.timeout(3600):  # 硬上限1小时：只防死循环，不掐正常长任务
@@ -2599,7 +2910,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                         print(f"[WS] Hermes API error {resp.status_code}: {error_body[:200]}")
                         if client_connected:
                             try:
-                                await websocket.send_json({"type": "chat_error", "message": f"API error {resp.status_code}"})
+                                await websocket.send_json({"type": "chat_error", "session_id": session_id, "message": f"API error {resp.status_code}"})
                             except Exception:
                                 pass
                         active_streams.pop(session_id, None)
@@ -2632,13 +2943,11 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                             #   ⚠️ 必须在置 client_connected=False **之前**发送，否则自己把自己挡住。
                             #   ⚠️ 用字符串拼接（禁 f-string 嵌套引号 —— 曾导致服务每 5 秒崩溃重启）。
                             if client_connected:
-                                try:
-                                    await websocket.send_json({
-                                        "type": "chat_error",
-                                        "message": "上游响应超时（超过 " + str(SSE_IDLE_TIMEOUT) + "s 无数据），已保存当前进度"
-                                    })
-                                except Exception:
-                                    pass
+                                await _push({
+                                    "type": "chat_error",
+                                    "session_id": session_id,
+                                    "message": "上游响应超时（超过 " + str(SSE_IDLE_TIMEOUT) + "s 无数据），已保存当前进度"
+                                })
                             client_connected = False
                             break
                         last_token_time = time.monotonic()
@@ -2675,7 +2984,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                     _lb = str(_tp.get("label"))[:40]
                                     print("[WS] 工具进度" + ("转发" if client_connected else "（客户端已断开，仅记录）") + " status=" + _st + " tool=" + _tl + " label=" + _lb + " [" + str(_tp.get("index")) + "/" + str(_tp.get("total")) + "]", flush=True)
                                     if client_connected:
-                                        await websocket.send_json({
+                                        await _push({
                                             "type": "chat_progress",
                                             "tool": _tp.get("tool", ""),
                                             "label": _tp.get("label", ""),
@@ -2721,7 +3030,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                         #   pending 已注册，用户回前台从「审批历史」提交、
                                         #   proxy 拦截照常唤醒下面的轮询循环 → 上游继续跑）
                                         try:
-                                            await websocket.send_json({
+                                            await _push({
                                                 "type": "approve_request",
                                                 "run_id": run_id,
                                                 "command": approval_evt.get("command", ""),
@@ -2790,7 +3099,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                         try:
                                             # S45-A：先告诉 APP 清理工具进度状态
                                             # （否则某条进度若没等到 completed，进度条会一直转）
-                                            await websocket.send_json({
+                                            await _push({
                                                 "type": "chat_progress",
                                                 "status": "stream_end",
                                                 "session_id": session_id,
@@ -2802,8 +3111,9 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             _metrics = _collect_turn_metrics(
                                                 session_id, _ttft_ms, _turn_started_wall)
                                             print(f"[Metrics] chat_done metrics={_metrics}", flush=True)
-                                            await websocket.send_json({
+                                            await _push({
                                                 "type": "chat_done",
+                                                "session_id": session_id,
                                                 "metrics": _metrics,
                                             })
                                         except Exception:
@@ -2833,8 +3143,9 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                                 
                                                     if client_connected:
                                                         try:
-                                                            await websocket.send_json({
+                                                            await _push({
                                                                 "type": "chat_token",
+                                                                "session_id": session_id,
                                                                 "seq": seq,
                                                                 "content": content,
                                                             })
@@ -2854,14 +3165,17 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
                                             pass
         
         # 整个流处理完成
-        if not client_connected:
+        # V4-S2: 判据从 client_connected 布尔改为粘性失败+帧计数
+        #   push_failures>0 = 有帧没送到（客户端未在线到流结束）→ 必写缓存
+        #   push_frames==0 = 零帧流（首帧就断）→ 布尔判据同样漏，补上
+        if push_failures > 0 or push_frames == 0:
             # 客户端已经断开，将拼好的完整数据存入本地 SQLite
             if full_response:
                 try:
                     db = sqlite3.connect(str(PUSH_DB))
                     db.execute(
-                        "INSERT OR REPLACE INTO offline_chats (session_id, content) VALUES (?, ?)",
-                        (session_id, full_response)
+                        "INSERT OR REPLACE INTO offline_chats (session_id, content, retention_until) VALUES (?, ?, ?)",
+                        (session_id, full_response, time.time() + 600)
                     )
                     db.commit()
                     db.close()
@@ -2880,7 +3194,7 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
             if not has_tokens:
                 try:
                     _metrics = _collect_turn_metrics(session_id, _ttft_ms, _turn_started_wall)
-                    await websocket.send_json({"type": "chat_done", "metrics": _metrics})
+                    await _push({"type": "chat_done", "session_id": session_id, "metrics": _metrics})
                 except Exception:
                     pass
         
@@ -2893,7 +3207,10 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         print(f"[WS] 本轮流已被新流取代（task cancelled）session={session_id}", flush=True)
         my_stream["status"] = "superseded"
         my_stream["completed_at"] = time.time()
-        active_streams[session_id] = my_stream
+        # V4-S5: CAS —— 只在全局表仍指向自己时才回写。
+        #   被取代时新流 preamble 已写入新对象，此处无条件回写会把新流挤掉（L2895 竞态）。
+        if active_streams.get(session_id) is my_stream:
+            active_streams[session_id] = my_stream
         raise
     except asyncio.TimeoutError:
         print(f"[WS] Chat stream timeout for {session_id}")
@@ -2904,12 +3221,19 @@ async def _chat_stream_handler(websocket: WebSocket, messages: list, session_id:
         print(f"[WS] Chat stream error: {e}")
         if client_connected:
             try:
-                await websocket.send_json({"type": "chat_error", "message": str(e)})
+                await websocket.send_json({"type": "chat_error", "session_id": session_id, "message": str(e)})
             except Exception:
                 pass
         my_stream["status"] = "error"
         my_stream["completed_at"] = time.time()
         my_stream.pop("reconnect_ws", None)
+    finally:
+        # V4-S14: 幂等终态更新（三出口统一走 finally：complete/superseded/error/timeout）
+        if client_msg_id:
+            try:
+                idem_update_status(client_msg_id, {"status": my_stream.get("status", "error")})
+            except Exception as _idem_e:
+                print(f"[Idem] 终态更新失败 key={client_msg_id}: {_idem_e}", flush=True)
 
 # 推送API (HTTP 触发 WebSocket 推送)
 @app.post("/api/push/ws")
@@ -3100,7 +3424,7 @@ async def cleanup_stale_streams():
         now = time.time()
         stale = [
             sid for sid, s in list(active_streams.items())
-            if s.get("status") in ("complete", "error", "timeout")
+            if s.get("status") in ("complete", "error", "timeout", "superseded")
             and now - s.get("completed_at", 0) > 600
         ]
         for sid in stale:
@@ -3112,6 +3436,25 @@ async def cleanup_stale_streams():
 @app.on_event("startup")
 async def start_cleanup_task():
     asyncio.create_task(cleanup_stale_streams())
+    # V4-S12/N2: 幂等表建表 + 启动清扫孤儿 processing 行
+    try:
+        _idem_ensure_table()
+        idem_recover_orphans()
+    except Exception as _ie:
+        print(f"[Idem] 启动初始化失败: {_ie}", flush=True)
+    # V4-S15: offline_chats.retention_until 迁移（幂等）
+    try:
+        _db = _idem_conn()
+        try:
+            _cols = {r[1] for r in _db.execute("PRAGMA table_info(offline_chats)")}
+            if "retention_until" not in _cols:
+                _db.execute("ALTER TABLE offline_chats ADD COLUMN retention_until REAL")
+                _db.commit()
+                print("[Offline] 已加列 offline_chats.retention_until", flush=True)
+        finally:
+            _db.close()
+    except Exception as _ae:
+        print(f"[Offline] retention_until 迁移失败: {_ae}", flush=True)
     print("[Startup] Stale stream cleanup task started")
 
 if __name__ == "__main__":
