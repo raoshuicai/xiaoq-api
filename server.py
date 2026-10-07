@@ -640,6 +640,9 @@ def _get_db() -> sqlite3.Connection:
 _token_snapshot_tmp: list = []
 
 
+PUSH_DB = Path(os.path.expanduser("~/.hermes/push_messages.db"))
+
+
 def _token_dbs() -> list:
     """HOTFIX 20261007: all state.db files for token stats. Desktop added."""
     paths = [STATE_DB]
@@ -647,9 +650,14 @@ def _token_dbs() -> list:
     if win_db.exists():
         try:
             # Windows Desktop 库被其进程锁定, 直连会 disk I/O error -> 拷贝只读快照
-            import shutil, tempfile
+            # 1.35GB 经 9p 拷贝约 17s, 每次请求都拷会拖垮接口 -> 快照复用(10 分钟内)
+            import shutil, tempfile, time as _time
             tmp = Path(tempfile.gettempdir()) / "win_state_token_snapshot.db"
-            shutil.copyfile(win_db, tmp)
+            stale = _time.time() - tmp.stat().st_mtime > 600 if tmp.exists() else True
+            if stale:
+                tmp_unlink = tmp.with_suffix(".copying")
+                shutil.copyfile(win_db, tmp_unlink)
+                tmp_unlink.replace(tmp)
             paths.append(tmp)
             _token_snapshot_tmp.append(tmp)
         except Exception:
@@ -716,6 +724,7 @@ def tokens_daily(request: Request, days: int = Query(7, ge=1, le=90, description
                 "date": day,
                 "input_tokens": d["in"],
                 "output_tokens": d["out"],
+                "cache_tokens": d["extra"],
                 "total_tokens": d["in"] + d["out"] + d["extra"],
                 "sessions": d["sessions"],
             })
@@ -834,12 +843,6 @@ def tokens_summary(request: Request):
                 mm["in"] += row["inp"]; mm["out"] += row["outp"]
                 mm["extra"] += row["cr"] + row["cw"] + row["rt"]; mm["c"] += row["c"]
         _token_close(dbs)
-        for _p in list(_token_snapshot_tmp):
-            try:
-                _p.unlink()
-            except Exception:
-                pass
-        _token_snapshot_tmp.clear()
 
         ad = max(1, month["days"])
         daily_avg = (month["in"] + month["out"] + month["extra"]) / ad
@@ -853,6 +856,7 @@ def tokens_summary(request: Request):
         return {
             "today": {
                 "input_tokens": today["in"], "output_tokens": today["out"],
+                "cache_tokens": today["extra"],
                 "total_tokens": today["in"] + today["out"] + today["extra"],
             },
             "this_month": {
