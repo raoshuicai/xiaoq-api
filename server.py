@@ -2972,7 +2972,7 @@ async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: l
         return ok
     try:
         has_tokens = False
-        async with asyncio.timeout(3600):  # 硬上限1小时：只防死循环，不掐正常长任务
+        async with asyncio.timeout(10800):  # 硬上限3小时（20261015 由 1h 提到 3h：1h 闸门曾掐断 app-3029 的整轮长任务）：只防死循环，不掐正常长任务
             async with httpx.AsyncClient(timeout=300.0) as client:
                 async with client.stream(
                     "POST",
