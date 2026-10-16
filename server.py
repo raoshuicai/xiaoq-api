@@ -2723,7 +2723,13 @@ async def websocket_push(websocket: WebSocket):
                                     "status": "stream_end",
                                     "session_id": session_id,
                                 })
-                                await websocket.send_json({"type": "chat_done", "session_id": session_id})
+                                # 补投的结束帧必须带上本轮指标：否则它与实时帧竞争时，
+                                #   先到的这一条（无 metrics）会把消息建好，指标永久丢失。
+                                await websocket.send_json({
+                                    "type": "chat_done",
+                                    "session_id": session_id,
+                                    "metrics": stream.get("metrics"),
+                                })
                                 # 同时写入离线缓存（完整回复）
                                 if stream["full_response"]:
                                     db = sqlite3.connect(str(PUSH_DB))
@@ -3184,6 +3190,11 @@ async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: l
                                         _metrics = _collect_turn_metrics(
                                             session_id, _ttft_ms, _turn_started_wall)
                                         print(f"[Metrics] chat_done metrics={_metrics}", flush=True)
+                                        # 指标落进流状态：补投路径的 chat_done 也要带它 ——
+                                        #   断线重连时 sync_pending 的补投帧可能先于实时帧到达，而客户端
+                                        #   handleDone 会清空 streamContent：先到者建好消息、后到者内容为
+                                        #   空被忽略 → 无 metrics 的那条赢了，指标永久丢失（实测 23:03）。
+                                        my_stream["metrics"] = _metrics
                                         await _push({
                                             "type": "chat_done",
                                             "session_id": session_id,
