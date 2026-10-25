@@ -29,6 +29,44 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 # ── Config ──────────────────────────────────────────────────────────
 SERVER_VERSION = "v1.0.1"   # V4 四bug修复：幂等模块/粘性计数/帧session_id/status拆档（S1-S15）
+
+# 手机端可见的会话来源：APP 自己 + 桌面/WebUI + CLI + 各聊天平台。
+# cron/subagent/oneshot 是内部调度噪音，不列（否则一天几十条把列表冲掉）。
+SESSION_SOURCES = ("api_server", "webui", "desktop", "tui", "cli",
+                   "feishu", "telegram", "weixin", "ntfy", "unknown")
+_SESSION_SRC_SQL = ", ".join(f"'{s}'" for s in SESSION_SOURCES)
+
+# 判断「另一端正在这个会话上跑 turn」：靠 state.db 的 last_activity_description
+# 命中特征 + last_activity_at 在窗口内。描述会永久残留（实测 9 天前的会话还写着
+# "terminal command running (81s elapsed)"），所以时间窗口是必要条件，不能只看字符串。
+_BUSY_DESC = ("receiving stream response", "tool running",
+              "terminal command running", "starting new turn")
+_BUSY_WINDOW_S = 90
+
+
+def _is_busy(desc: Optional[str], at: Optional[float]) -> bool:
+    if not desc or not at:
+        return False
+    return (time.time() - float(at)) <= _BUSY_WINDOW_S and any(p in desc for p in _BUSY_DESC)
+
+
+def _session_busy(session_id: str) -> tuple[bool, str]:
+    """这个会话是不是正在被另一端（桌面/WebUI/CLI）跑。返回 (busy, 描述)。"""
+    try:
+        db = _state_db()
+        row = db.execute(
+            "SELECT last_activity_at, last_activity_description FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        db.close()
+    except Exception as e:
+        print(f"[Busy] 查询失败 session={session_id}: {e}", flush=True)
+        return False, ""
+    if row is None:
+        return False, ""
+    desc = row[1] or ""
+    return (_is_busy(desc, row[0]), desc)
+
 # ── Proxy Config ──────────────────────────────────────────────────────
 # 出站代理：用于访问外部 API（OpenRouter、华为 Push Kit 等）
 # 入站请求不受影响（FastAPI 本身不使用这些变量）
@@ -69,7 +107,9 @@ if _ENV_FILE.exists():
             if _key.strip() not in os.environ:
                 os.environ[_key.strip()] = _val.strip()
 
-OBSIDIAN_VAULT = Path(os.getenv("OBSIDIAN_VAULT", "/mnt/c/Users/xiaoq/Documents/Obsidian/hermes-vault"))
+OBSIDIAN_VAULT = Path(os.getenv("OBSIDIAN_VAULT",
+    r"C:\Users\xiaoq\Documents\Obsidian\hermes-vault" if os.name == "nt"
+    else "/mnt/c/Users/xiaoq/Documents/Obsidian/hermes-vault"))
 STATE_DB = Path(os.getenv("STATE_DB", os.path.expanduser("~/.hermes/state.db")))
 API_KEY = os.getenv("XIAOQ_API_KEY", os.getenv("API_SERVER_KEY", ""))
 PORT = int(os.getenv("PORT", "8089"))
@@ -144,7 +184,7 @@ from fastapi.responses import FileResponse
 @app.get("/dl/apk")
 def download_apk():
     """直接下载最新 APK"""
-    apk = Path("/home/xiaoq/workspace/hermes-xiaoq-app/小Q-v2.0.10.apk")
+    apk = Path(os.getenv("APK_PATH", r"D:\05_HarmonyNext\XiaoQ\dist\小Q.apk"))
     if not apk.exists():
         raise HTTPException(status_code=404, detail="APK not found")
     return FileResponse(
@@ -646,7 +686,7 @@ PUSH_DB = Path(os.path.expanduser("~/.hermes/push_messages.db"))
 def _token_dbs() -> list:
     """HOTFIX 20261007: all state.db files for token stats. Desktop added."""
     paths = [STATE_DB]
-    win_db = Path("/mnt/c/Users/HW/AppData/Local/hermes/state.db")
+    win_db = Path(os.getenv("WIN_STATE_DB", r"C:\Users\HW\AppData\Local\hermes\state.db"))
     if win_db.exists():
         try:
             # Windows Desktop 库被其进程锁定, 直连会 disk I/O error -> 拷贝只读快照
@@ -1321,7 +1361,7 @@ async def cron_job_update(job_id: str, request: Request):
 #          cron / CLI / 其它平台产生的几百个会话不该出现在 APP 列表里
 # ══════════════════════════════════════════════════════════════════════
 
-STATE_DB = Path(os.path.expanduser("~/.hermes/state.db"))
+STATE_DB = Path(os.getenv("STATE_DB") or os.path.expanduser("~/.hermes/state.db"))
 
 
 def _state_db():
@@ -1345,13 +1385,14 @@ def list_sessions(
         # updated_at 用最后一条消息的时间，没有消息时回退 started_at
         # archived=1 的会话是用户在 APP 里删掉的（软删除，Hermes 侧数据保留）
         total = db.execute(
-            "SELECT COUNT(*) FROM sessions WHERE source = 'api_server'"
+            f"SELECT COUNT(*) FROM sessions WHERE source IN ({_SESSION_SRC_SQL})"
             " AND COALESCE(archived, 0) = 0"
         ).fetchone()[0]
 
-        rows = db.execute("""
+        rows = db.execute(f"""
             SELECT s.id, s.title, s.model, s.started_at, s.message_count,
-                   s.input_tokens, s.output_tokens,
+                   s.input_tokens, s.output_tokens, s.source, s.tool_call_count,
+                   s.last_activity_at, s.last_activity_description,
                    COALESCE((SELECT MAX(m.timestamp) FROM messages m
                              WHERE m.session_id = s.id), s.started_at) AS updated_at,
                    (SELECT m.content FROM messages m
@@ -1359,7 +1400,7 @@ def list_sessions(
                        AND m.content IS NOT NULL AND TRIM(m.content) <> ''
                      ORDER BY m.timestamp ASC LIMIT 1) AS first_user_msg
             FROM sessions s
-            WHERE s.source = 'api_server'
+            WHERE s.source IN ({_SESSION_SRC_SQL})
               AND COALESCE(s.archived, 0) = 0
             ORDER BY updated_at DESC
             LIMIT ? OFFSET ?
@@ -1381,6 +1422,11 @@ def list_sessions(
                 "updated_at": int(r["updated_at"]) if r["updated_at"] else 0,
                 "message_count": r["message_count"] or 0,
                 "tokens": (r["input_tokens"] or 0) + (r["output_tokens"] or 0),
+                # 跨端可见：来源标记 + 当前在干什么（桌面/WebUI 会话也走这里）
+                "source": r["source"] or "",
+                "tool_calls": r["tool_call_count"] or 0,
+                "activity": r["last_activity_description"] or "",
+                "active": _is_busy(r["last_activity_description"], r["last_activity_at"]),
             })
         db.close()
         return {
@@ -1748,6 +1794,13 @@ def session_messages(
             ORDER BY timestamp DESC, id DESC
             LIMIT ? OFFSET ?
         """, (session_id, limit, offset)).fetchall()
+        # 跨端可见性（2026-10-25）：把会话级状态随包返回。
+        #   APP 轮询「桌面会话」时只看这一个接口就能判断对面还在不在跑、跑到哪一步，
+        #   不必再额外打一次 /api/sessions 去列表里找自己。
+        meta = db.execute(
+            "SELECT source, last_activity_at, last_activity_description, message_count"
+            " FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
         db.close()
 
         items = []
@@ -1767,6 +1820,15 @@ def session_messages(
             "items": items,
             "total": total,
             "has_more": (offset + len(items)) < total,
+            # 会话级状态：source = 哪一端建的；active = 对面是否正在这一轮里跑
+            "session": {
+                "id": session_id,
+                "source": (meta[0] or "") if meta else "",
+                "active": _is_busy((meta[2] or "") if meta else None,
+                                  meta[1] if meta else None),
+                "activity": (meta[2] or "") if meta else "",
+                "message_count": (meta[3] or 0) if meta else 0,
+            },
         }
     except HTTPException:
         raise
@@ -2368,8 +2430,34 @@ async def proxy_hermes_v1(request: Request, path: str):
                 # S42：已超时的记录 —— 交给下面的代理请求直接补交 Gateway
                 _pending_approvals.pop(run_id, None)
                 print(f"[Proxy] 审批为超时记录，交由代理补交: run={run_id[:12]}", flush=True)
-        except Exception:
-            pass
+
+            # ── 字段规范化（P4 修复，2026-10-25）──────────────────────────
+            # 背景：APP 发的是 {"approval": "once"}，而 Gateway v0.21.3+ 的
+            #   _handle_run_approval 只读 body["choice"]：
+            #       raw_choice = str(body.get("choice", "")).strip().lower()
+            #   读不到就落空 -> code=invalid_approval_choice -> HTTP 400
+            #   （用户侧表现：「授权提交失败：HTTP 400」）
+            # 以前能用是因为走的是旧的自写补丁，那个补丁认 approval 字段；
+            #   v0.21.7 原生实现只认 choice。
+            # 修法：在转发前统一成 {"choice": ...}，APP 端无需改动、无需重编译。
+            #
+            # 同时做中文 choice 映射 —— APP 某些入口会传中文按钮文案，
+            #   Gateway 的 _APPROVAL_CHOICE_ALIASES 不含中文，不映射同样 400。
+            _CN_CHOICE = {
+                "同意本次": "once", "允许一次": "once", "同意": "once", "允许": "once",
+                "同意会话": "session", "本次会话": "session", "本次允许": "session",
+                "总是同意": "always", "始终允许": "always", "总是允许": "always",
+                "拒绝": "deny", "禁止": "deny", "不同意": "deny", "拒绝本次": "deny",
+            }
+            choice = _CN_CHOICE.get(str(choice).strip(), choice)
+            _norm_body = {"choice": choice}
+            # 透传这几个 Gateway 认识的附加字段（room-scoped / 批量放行场景用）
+            for _k in ("request_id", "all", "resolve_all"):
+                if body_data.get(_k) is not None:
+                    _norm_body[_k] = body_data[_k]
+            body_bytes = json.dumps(_norm_body).encode("utf-8")
+        except Exception as _norm_e:
+            print(f"[Proxy] 审批 body 规范化失败（按原样转发）: {_norm_e}", flush=True)
 
     async with httpx.AsyncClient(timeout=1800.0) as client:
         url = f"{HERMES_API}/v1/{path}"
@@ -2377,6 +2465,13 @@ async def proxy_hermes_v1(request: Request, path: str):
             url += f"?{request.query_params}"
         headers = dict(request.headers)
         headers.pop("host", None)
+        # ⚠️ 必须剔掉 content-length：上面的审批分支会把 body 规范化成
+        #   {"choice": ...}，长度与原 body 不同。若不删，httpx 会用这个旧值
+        #   声明长度却发送新 body → h11.LocalProtocolError:
+        #   "Too little data for declared Content-Length" → HTTP 500。
+        # 同理 content-encoding：body 已被替换成明文 JSON，不能再声称是压缩的。
+        headers.pop("content-length", None)
+        headers.pop("content-encoding", None)
         resp = await client.request(
             method=request.method, url=url, headers=headers,
             content=body_bytes, follow_redirects=False,
@@ -2592,6 +2687,20 @@ async def websocket_push(websocket: WebSocket):
                     session_id = "app-" + uuid.uuid4().hex[:16]
                     print(f"[WS] 新建会话 {session_id} (client={client_id})", flush=True)
                 print(f"[WS] 流式聊天 from {client_id}, session={session_id}, messages={len(messages)}", flush=True)
+
+                # 跨端占用保护：APP 往桌面/WebUI/CLI 的会话里发消息时，如果那一端正在跑 turn，
+                # 两条回复会写进同一个会话（Gateway 对同一 session 串行，后一条会读到前一条的流）。
+                # APP 自己创建的会话（app-*）由下面的 active_streams / 幂等表接管，不在这里拦。
+                if not session_id.startswith("app-"):
+                    _busy, _desc = _session_busy(session_id)
+                    if _busy:
+                        print(f"[WS] 会话占用中，拒绝发送 session={session_id} desc={_desc}", flush=True)
+                        await websocket.send_json({
+                            "type": "chat_error",
+                            "session_id": session_id,
+                            "message": f"这个会话正在另一端执行（{_desc}），等它跑完再发",
+                        })
+                        continue
 
                 # V4-S13: 双轨防护（N4）——有 client_msg_id 走幂等表（跨连接/重启都拦得住）；
                 #   老 APP 无该字段 → 保留原「同一连接防重复」防护（灰度期不裸奔）。
