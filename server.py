@@ -100,7 +100,9 @@ def _httpx_async_client(timeout: float, use_proxy: bool = False):
 # Load .env for OpenRouter credentials
 _ENV_FILE = Path(os.path.expanduser("~/.hermes/.env"))
 if _ENV_FILE.exists():
-    for _line in _ENV_FILE.read_text().splitlines():
+    # ⚠️ 必须显式 utf-8：Windows 中文 locale 下 Path.read_text() 默认按 GBK 解码，
+    #    .env 里只要有一条中文注释就 UnicodeDecodeError，进程直接起不来（实测 2026-10-25）。
+    for _line in _ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _key, _, _val = _line.partition("=")
