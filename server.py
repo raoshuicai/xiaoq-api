@@ -1756,6 +1756,65 @@ def _idem_ensure_table():
         db.close()
 
 
+@app.get("/api/sessions/{session_id}/meta")
+def session_meta(session_id: str, request: Request):
+    """跨端会话轮询专用的轻量探针（约 300 字节）。
+
+    背景：APP 打开「外部会话」（桌面/WebUI 建的）时会定时轮询，原先每次拉
+    100 条历史（实测 80KB），只为了判断「有没有新消息 / 对面还在不在跑」。
+    这里只回判据需要的最小信息，客户端无变化时不再拉历史。
+
+    判据三元组：
+      last_msg_id —— 末条有效消息 id（判断"有新增"）
+      last_len    —— 末条正文长度（判断"正文被回填"：一轮结束时正文是回填到
+                     已有 assistant 行上的，条数与 id 都不变，只看 id 会漏刷）
+      active      —— 对面是否正在这一轮里跑（_is_busy：state.db 的
+                     last_activity_description 命中特征 + 90s 窗口）
+
+    口径与 /messages 一致：排除 rewind 幽灵行（active=0 且 compacted=0）。
+    """
+    check_auth(request)
+    try:
+        db = _state_db()
+        db.row_factory = sqlite3.Row
+
+        exists = db.execute(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if exists is None:
+            db.close()
+            # 与 /messages 一致：会话不存在必须 404，否则客户端会空轮询一个幽灵会话
+            raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
+
+        row = db.execute(
+            "SELECT id, LENGTH(content) AS len FROM messages "
+            "WHERE session_id = ? AND (active = 1 OR compacted = 1) "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+
+        meta = db.execute(
+            "SELECT source, last_activity_at, last_activity_description, message_count "
+            "FROM sessions WHERE id = ?", (session_id,),
+        ).fetchone()
+        db.close()
+
+        return {
+            "id": session_id,
+            "source": (meta["source"] or "") if meta else "",
+            "active": _is_busy((meta["last_activity_description"] or "") if meta else None,
+                               meta["last_activity_at"] if meta else None),
+            "activity": (meta["last_activity_description"] or "") if meta else "",
+            "message_count": (meta["message_count"] or 0) if meta else 0,
+            "last_msg_id": (row["id"] or 0) if row else 0,
+            "last_len": (row["len"] or 0) if row else 0,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session meta error: {e}")
+
+
 @app.get("/api/sessions/{session_id}/messages")
 def session_messages(
     session_id: str,
