@@ -1,0 +1,100 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 8045b003177..0e7f99f0a7e 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -1723,6 +1723,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             ("GET", "/health/detailed", self._handle_health_detailed),
+             ("GET", "/v1/health", self._handle_health),
+             ("GET", "/v1/models", self._handle_models),
++            # 会话级 YOLO 开关（APP 的 Y 气泡）—— 上游无此端点，本地补丁 yolo-session-endpoint
++            ("GET", "/v1/session/yolo", self._handle_session_yolo),
++            ("POST", "/v1/session/yolo", self._handle_session_yolo),
+             ("GET", "/api/model/options", self._handle_model_options),
+             ("GET", "/v1/capabilities", self._handle_capabilities),
+             # Browser-control (gated on browser.extension_control.enabled + API key): POST
+@@ -2471,6 +2474,62 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+             # Contract: RFC3339 string | null, never a number (legacy epoch floats exist).
+             "updated_at": normalize_updated_at(runtime.get("updated_at")), "pid": os.getpid()})
+ 
++    @_require_auth
++    async def _handle_session_yolo(self, request: web.Request) -> web.Response:
++        """GET/POST /v1/session/yolo — 查询/切换某会话的 YOLO（跳过危险命令审批）。
++
++        APP（小Q）左下角「Y」气泡调这里。审批层把 YOLO 挂在 ``set_current_session_key``
++        的 key 上，而 chat 侧该 key 是每次请求的 approval_session_key（= completion_id），
++        所以本端点只存「会话级意图」（key = X-Hermes-Session-Id），真正生效靠
++        ``_run_agent`` 里的继承：本会话开了 YOLO，就把当次 run 的 approval key 也打开。
++
++        GET  → {"session_key": "...", "yolo": bool}
++        POST body {"enabled": true|false}；不带 enabled 则取反。
++
++        状态是**进程内内存**（与 /yolo 命令一致），Gateway 重启即清。
++        """
++        from tools.approval import (
++            disable_session_yolo,
++            enable_session_yolo,
++            is_session_yolo_enabled,
++        )
++
++        gateway_session_key, key_err = self._parse_session_key_header(request)
++        if key_err is not None:
++            return key_err
++        session_key = (
++            gateway_session_key
++            or request.headers.get("X-Hermes-Session-Id", "").strip()
++        )
++        if not session_key:
++            return web.json_response(
++                {"error": "missing session key: send X-Hermes-Session-Id header"},
++                status=400,
++            )
++
++        if request.method == "GET":
++            return web.json_response({
++                "session_key": session_key,
++                "yolo": is_session_yolo_enabled(session_key),
++            })
++
++        try:
++            body = await request.json()
++        except Exception:
++            body = {}
++        if isinstance(body, dict) and "enabled" in body:
++            enabled = bool(body.get("enabled"))
++        else:
++            enabled = not is_session_yolo_enabled(session_key)
++
++        (enable_session_yolo if enabled else disable_session_yolo)(session_key)
++        logger.info(
++            "session yolo %s: %s",
++            "enabled" if enabled else "disabled",
++            session_key[:24],
++        )
++        return web.json_response({"session_key": session_key, "yolo": enabled})
++
+     @_require_auth
+     async def _handle_models(self, request: web.Request) -> web.Response:
+         """GET /v1/models — hermes-agent plus configured model_routes aliases (alias + resolved
+@@ -4285,6 +4344,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+                         from tools.approval_context import set_current_session_key
+                         approval_token = set_current_session_key(approval_session_key)
+                         register_gateway_notify(approval_session_key, approval_notify_callback)
++                        # 会话级 YOLO 继承：本会话在 /v1/session/yolo 开了 YOLO，就把这次 run 的
++                        # approval key 也打开（上游按 completion_id 记账，不继承则 Y 按钮无效）。
++                        try:
++                            from tools.approval import (
++                                enable_session_yolo as _enable_yolo,
++                                is_session_yolo_enabled as _yolo_on,
++                            )
++                            for _yk in (session_id, gateway_session_key):
++                                if _yk and _yolo_on(_yk):
++                                    _enable_yolo(approval_session_key)
++                                    logger.info(
++                                        "session yolo inherited: %s -> run %s",
++                                        _yk[:24], str(approval_session_key)[:24])
++                                    break
++                        except Exception:
++                            logger.debug("session yolo inherit failed", exc_info=True)
+                     try:
+                         with notification_turn(agent, muted=muted, session_id=session_id or ""):
+                             result = agent.run_conversation(**conversation_kwargs)
