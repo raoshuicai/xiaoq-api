@@ -617,5 +617,134 @@ def register_voice_routes(app, ctx: dict) -> None:
             raise HTTPException(status_code=404, detail="SEGMENT_NOT_FOUND")
         return FileResponse(str(mp3), media_type="audio/mpeg")
 
+    # ── 5) 流式预合成器（P3）────────────────────────────────────────
+    class _LiveSynth:
+        """边生成边合成：token 流里按句末标点切段，切出来立刻丢后台合成。
+
+        用法（server.py 的 _chat_stream_handler 内）：
+            synth = make_live_synth(turn_key=client_msg_id, voice="claire")
+            ... token 循环 ...
+            synth.feed(content)          # 同步、非阻塞，只做切句 + create_task
+            ...
+            segs = await synth.finish()  # 等全部合成完，返回段清单
+
+        ⚠️ 与「回复生成完再整段合成」的区别就是 P3 的全部价值：
+           agent 一轮要跑 30-120 秒，这段时间里语音早就一段段备好了，
+           chat_done 一到客户端就能直接开播（零等待）。
+        """
+
+        def __init__(self, turn_key: str, voice: str = DEFAULT_VOICE):
+            self.turn = turn_key
+            self.voice = voice if voice in ALLOWED_VOICES else DEFAULT_VOICE
+            self._buf: str = ""
+            self._cursor: int = 0
+            self._tasks: list = []
+            self._closed: bool = False
+            self._key: str = _api_key()
+
+        # 同步：只做切句 + 起任务，绝不 await
+        def feed(self, token_text: str) -> None:
+            if self._closed or not token_text:
+                return
+            self._buf += token_text
+            pos = -1
+            for i in range(len(self._buf) - 1, -1, -1):
+                if self._buf[i] in _SENT_END:
+                    pos = i
+                    break
+            if pos < 0:
+                return
+            chunk = self._buf[:pos + 1]
+            self._buf = self._buf[pos + 1:]
+            self._spawn(chunk)
+
+        def _spawn(self, chunk: str) -> None:
+            try:
+                segs = split_sentences(chunk)
+            except Exception as e:      # noqa: BLE001
+                print(f"[Voice] live 分句异常: {e}", flush=True)
+                return
+            for s in segs:
+                idx = self._cursor
+                self._cursor += 1
+                item = {"idx": idx, "text": s["text"]}
+                _ensure_pending_meta(self.turn, item, self.voice)
+                if not self._key:
+                    continue
+                task = asyncio.create_task(
+                    self._synth_one_live(item, self.voice, self._key))
+                self._tasks.append(task)
+
+        async def _synth_one_live(self, item: dict, voice: str, key: str) -> None:
+            try:
+                async with make_client(60.0, False) as client:
+                    await _synth_one(client, self.turn, item["idx"],
+                                     item["text"], voice, key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:      # noqa: BLE001
+                print(f"[Voice] live 合成异常 idx={item['idx']}: {e}", flush=True)
+
+        async def finish(self, timeout: float = 120.0) -> list:
+            """等全部段合成完（含尾部残留 buffer），返回段清单。"""
+            self._closed = True
+            if self._buf.strip():
+                self._spawn(self._buf)
+                self._buf = ""
+            if not self._tasks:
+                return []
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._tasks, return_exceptions=True),
+                    timeout=timeout)
+            except asyncio.TimeoutError:
+                print(f"[Voice] live 合成超时 turn={self.turn} "
+                      f"({len(self._tasks)} 段)", flush=True)
+            print(f"[Voice] live 完成 turn={self.turn} segs={self._cursor}",
+                  flush=True)
+            return self.segments()
+
+        def segments(self) -> list:
+            """读目录拼出当前段清单（ready/pending）。"""
+            out = []
+            for i in range(self._cursor):
+                mp3 = _turn_dir(self.turn) / f"{i}.mp3"
+                meta_path = _turn_dir(self.turn) / f"{i}.json"
+                text = ""
+                dur = 0
+                st = "pending"
+                try:
+                    if meta_path.is_file():
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        text = meta.get("text", "")
+                        dur = int(meta.get("duration_ms", 0))
+                        if meta.get("status") == "ready":
+                            st = "ready"
+                except Exception:
+                    pass
+                if st == "ready" and not (mp3.is_file() and mp3.stat().st_size > 0):
+                    st = "pending"
+                out.append({"idx": i, "text": text, "duration_ms": dur,
+                            "status": st,
+                            "url": f"/api/tts/segments/{self.turn}/{i}.mp3"})
+            return out
+
+        def cancel(self) -> None:
+            self._closed = True
+            for t in self._tasks:
+                if not t.done():
+                    t.cancel()
+
+    def make_live_synth(turn_key: str, voice: str = DEFAULT_VOICE):
+        """给 server.py 用的工厂（voice 关闭时返回 None）。"""
+        if not voice_enabled() or not turn_key:
+            return None
+        safe = TURN_KEY_RE.sub("", turn_key)[:64]
+        if not safe:
+            return None
+        return _LiveSynth(safe, voice)
+
     print(f"[Voice] 语音路由已注册 (enabled={voice_enabled()}, "
           f"tts_root={tts_root})", flush=True)
+
+    return {"make_live_synth": make_live_synth, "enabled": voice_enabled()}

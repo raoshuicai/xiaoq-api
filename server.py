@@ -392,13 +392,14 @@ def get_upload(name: str):
 # ══════════════════════════════════════════════════════════════════════
 try:
     from voice_api import register_voice_routes
-    register_voice_routes(app, {
+    VOICE_CTX = register_voice_routes(app, {
         "check_auth": check_auth,
         "upload_dir": UPLOAD_DIR,
         "make_client": _httpx_async_client,
         "safe_name": _safe_upload_name,
     })
 except Exception as _voice_err:      # noqa: BLE001 —— 语音挂了也必须让主服务起来
+    VOICE_CTX = None
     print(f"[Voice] 注册失败，语音功能不可用（其余功能正常）: {_voice_err}", flush=True)
 
 
@@ -2917,7 +2918,7 @@ async def websocket_push(websocket: WebSocket):
                     "session_id": session_id,
                 })
                 await _chat_stream_handler(client_id, websocket, messages, session_id, req_model,
-                                           client_msg_id)
+                                           client_msg_id, bool(data.get("auto_speak")))
             # 同步挂起缓存的消息回复（支持断点续流）
             elif data.get("type") == "sync_pending":
                 session_id = data.get("session_id")
@@ -3148,7 +3149,8 @@ def _collect_turn_metrics(session_id: str, ttft_ms, started_wall: float) -> dict
 
 
 async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: list, session_id: str,
-                               model: str = "", client_msg_id: str = ""):
+                               model: str = "", client_msg_id: str = "",
+                               auto_speak: bool = False):
     """通过 Hermes API 流式处理聊天，结果通过 WebSocket 推送
 
     `model` = APP 侧选中的模型别名（来自 /api/models 的 id）。
@@ -3188,6 +3190,27 @@ async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: l
     my_stream = {"seq": 0, "tokens": [], "full_response": "", "status": "processing",
                  "ws": websocket, "task": asyncio.current_task()}
     active_streams[session_id] = my_stream
+
+    # ══════════════════════════════════════════════════════════════════
+    #  P3：流式预合成（边生成边转语音）
+    #
+    #  只在这两种情况下开：客户端 🔊 开着（chat 帧 auto_speak=true）。
+    #  agent 一轮要跑 30-120 秒，这段时间里语音一段段备好 —— chat_done 一到
+    #  客户端就能直接开播，这就是「发语音就回语音」零等待的来源。
+    #  🔉 关着时这里完全不动作，一分钱不花。
+    # ══════════════════════════════════════════════════════════════════
+    _synth = None
+    if auto_speak and VOICE_CTX is not None:
+        try:
+            _turn_key = client_msg_id or ("turn-" + str(int(time.time() * 1000)))
+            _synth = VOICE_CTX["make_live_synth"](_turn_key)
+            if _synth is not None:
+                print(f"[Voice] live synth 启动 turn={_turn_key} session={session_id}",
+                      flush=True)
+        except Exception as _ve:        # noqa: BLE001
+            _synth = None
+            print(f"[Voice] live synth 创建失败: {_ve}", flush=True)
+
     
     # 先发一个思考状态，告诉用户正在处理
     try:
@@ -3478,6 +3501,12 @@ async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: l
                                                         print(f"[Metrics] first token after {_ttft_ms:.0f}ms (session={session_id})", flush=True)
                                                     has_tokens = True
                                                     full_response += content
+                                                    # P3：喂给流式预合成器（同步、非阻塞，只做切句 + 起任务）
+                                                    if _synth is not None:
+                                                        try:
+                                                            _synth.feed(content)
+                                                        except Exception:
+                                                            pass
                                                     # 分配序列号（全部走本次流的局部对象）
                                                     seq = my_stream["seq"]
                                                     my_stream["seq"] = seq + 1
@@ -3542,6 +3571,28 @@ async def _chat_stream_handler(client_id: str, websocket: WebSocket, messages: l
                 except Exception:
                     pass
         
+        # P3：等语音全部合成完 → 推 chat_voice_ready（**不阻塞** chat_done）
+        #
+        # ⚠️ 为什么不用 chat_done 当「音频能播了」的信号：流结束到 TTS 全好还有
+        #    几秒到十几秒，客户端按 chat_done 开播会扑空。独立帧才准。
+        if _synth is not None:
+            async def _push_voice_ready(_s, _sid):
+                try:
+                    segs = await _s.finish()
+                    if not segs:
+                        return
+                    await _push({
+                        "type": "chat_voice_ready",
+                        "session_id": _sid,
+                        "turn_key": _s.turn,
+                        "segments": segs,
+                    })
+                    print(f"[Voice] chat_voice_ready turn={_s.turn} segs={len(segs)}",
+                          flush=True)
+                except Exception as _e:      # noqa: BLE001
+                    print(f"[Voice] voice_ready 推送失败: {_e}", flush=True)
+            asyncio.create_task(_push_voice_ready(_synth, session_id))
+
         # 标记完成，保留 token 缓冲供后续 sync_pending 查询
         my_stream["status"] = "complete"
         my_stream["completed_at"] = time.time()
