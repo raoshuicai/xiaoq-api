@@ -348,11 +348,84 @@ def register_voice_routes(app, ctx: dict) -> None:
         try:
             meta_path.write_text(json.dumps(
                 {"cache_key": cache_key, "text": text, "duration_ms": dur,
-                 "voice": voice, "at": int(time.time())}, ensure_ascii=False),
+                 "voice": voice, "status": "ready", "at": int(time.time())},
+                ensure_ascii=False),
                 encoding="utf-8")
         except OSError:
             pass
         return {"idx": idx, "text": text, "duration_ms": dur, "status": "ready"}
+
+    # ── 后台合成任务管理（P2 异步 prepare）────────────────────────────
+    # turn -> asyncio.Task。同一 turn 只允许一个任务；全局并发上限防刷。
+    _tts_jobs: dict = {}
+    MAX_TTS_JOBS: int = 3
+
+    def _seg_state(turn: str, seg: dict, voice: str):
+        """查段缓存：返回 ('ready'|'pending', duration_ms)。"""
+        d = _turn_dir(turn)
+        mp3 = d / f"{seg['idx']}.mp3"
+        meta_path = d / f"{seg['idx']}.json"
+        cache_key = hashlib.sha256(
+            f"{turn}:{seg['idx']}:{seg['text']}:{voice}".encode("utf-8")).hexdigest()[:20]
+        if mp3.is_file() and mp3.stat().st_size > 0 and meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if meta.get("cache_key") == cache_key and meta.get("status") == "ready":
+                    return "ready", int(meta.get("duration_ms", 0))
+            except Exception:
+                pass
+        return "pending", 0
+
+    def _ensure_pending_meta(turn: str, seg: dict, voice: str) -> None:
+        """给「还没合成」的段先写一份 pending 元数据。
+
+        ⚠️ 为什么必须写：GET /api/tts/segments 是按目录里的 *.json 枚举段的，
+           合成中的段没有 json 就**完全不出现在列表里** → 客户端不知道总共几段，
+           会把「只返回 1 段」当成「只有 1 段」，播完第一句就以为结束了（实测踩到）。
+        """
+        d = _turn_dir(turn)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        meta_path = d / f"{seg['idx']}.json"
+        cache_key = hashlib.sha256(
+            f"{turn}:{seg['idx']}:{seg['text']}:{voice}".encode("utf-8")).hexdigest()[:20]
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if (meta.get("cache_key") == cache_key
+                        and meta.get("status") == "ready"
+                        and (d / f"{seg['idx']}.mp3").is_file()):
+                    return
+            except Exception:
+                pass
+        try:
+            meta_path.write_text(json.dumps(
+                {"cache_key": cache_key, "text": seg["text"], "duration_ms": 0,
+                 "voice": voice, "status": "pending", "at": int(time.time())},
+                ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    async def _synth_all(turn: str, segs: list, voice: str, key: str) -> None:
+        """后台逐段合成。串行（实测并行无收益），任何异常只记日志不外抛。
+
+        ⚠️ finally 里必须把自己从 _tts_jobs 摘掉 —— 否则同一 turn 永远起不来新任务，
+           客户端会一直轮询到超时。
+        """
+        try:
+            async with make_client(60.0, False) as client:
+                for seg in segs:
+                    await _synth_one(client, turn, seg["idx"], seg["text"], voice, key)
+            print(f"[Voice] 后台合成完成 turn={turn} segs={len(segs)}", flush=True)
+        except asyncio.CancelledError:
+            print(f"[Voice] 后台合成被取消 turn={turn}", flush=True)
+            raise
+        except Exception as e:      # noqa: BLE001
+            print(f"[Voice] 后台合成异常 turn={turn}: {e}", flush=True)
+        finally:
+            _tts_jobs.pop(turn, None)
 
     # ── 1) POST /api/asr ──────────────────────────────────────────────
     @app.post("/api/asr")
@@ -446,19 +519,37 @@ def register_voice_routes(app, ctx: dict) -> None:
 
         _cleanup_tts()
 
+        # ⚠️ 异步化（P2）：旧实现是把所有段合成完才返回（4 段 8.34s），
+        #    客户端点播放要干等 8 秒才能出声，达不到「1.5s 内出声」的验收线。
+        #    现在：已缓存的段立即标 ready，缺的丢后台任务，**立刻返回**；
+        #    客户端拉 GET /api/tts/segments 轮询，第一段 ready 就开播。
         out = []
-        t0 = time.monotonic()
-        async with make_client(60.0, False) as client:
-            for seg in segs:
-                out.append(await _synth_one(client, turn, seg["idx"],
-                                            seg["text"], voice, key))
-        ready = sum(1 for s in out if s["status"] == "ready")
-        print(f"[Voice] prepare turn={turn} segs={len(out)} ready={ready} "
-              f"{(time.monotonic() - t0):.2f}s voice={voice}", flush=True)
+        pending = []
+        for seg in segs:
+            st, dur = _seg_state(turn, seg, voice)
+            if st == "pending":
+                _ensure_pending_meta(turn, seg, voice)   # 让 segments 接口能列出全部段
+            out.append({"idx": seg["idx"], "text": seg["text"],
+                        "duration_ms": dur, "status": st,
+                        "url": f"/api/tts/segments/{turn}/{seg['idx']}.mp3"})
+            if st == "pending":
+                pending.append(seg)
+
+        started = False
+        if pending and turn not in _tts_jobs and len(_tts_jobs) < MAX_TTS_JOBS:
+            task = asyncio.create_task(_synth_all(turn, pending, voice, key))
+            _tts_jobs[turn] = task
+            started = True
+        elif pending and (turn in _tts_jobs or len(_tts_jobs) >= MAX_TTS_JOBS):
+            # 已在合成 / 并发已满：照常返回 pending，客户端轮询等待
+            started = False
+
+        ready_n = sum(1 for s in out if s["status"] == "ready")
+        print(f"[Voice] prepare turn={turn} segs={len(out)} ready={ready_n} "
+              f"pending={len(pending)} started={started} voice={voice}", flush=True)
 
         return {"turn_key": turn, "truncated": truncated,
-                "segments": [dict(s, url=f"/api/tts/segments/{turn}/{s['idx']}.mp3")
-                             for s in out]}
+                "async": started, "segments": out}
 
     # ── 3) GET /api/tts/segments ──────────────────────────────────────
     @app.get("/api/tts/segments")
@@ -480,7 +571,8 @@ def register_voice_routes(app, ctx: dict) -> None:
                 continue
             idx = int(meta_path.stem)
             mp3 = d / f"{idx}.mp3"
-            ok = mp3.is_file() and mp3.stat().st_size > 0
+            ok = (mp3.is_file() and mp3.stat().st_size > 0
+                  and meta.get("status") == "ready")
             segs.append({"idx": idx, "text": meta.get("text", ""),
                          "duration_ms": int(meta.get("duration_ms", 0)),
                          "status": "ready" if ok else "pending",
