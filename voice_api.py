@@ -40,6 +40,9 @@ MAX_AUDIO_BYTES = 20 * 1024 * 1024    # 单条语音上限（与 /api/upload 一
 MAX_TTS_CHARS = 2000                  # 单次 prepare 的文本上限
 MAX_SEGS_PER_TURN = 60                # 一轮最多几段（防 agent 吐超长）
 SEG_TTL_SECONDS = 48 * 3600           # 段文件生命周期（独立于 uploads 的 30 天）
+# 段合成并发数。实测 SiliconFlow 吃得下并发 5（8 段：串行 17.8s → 并发3 7.4s → 并发5 3.7s）。
+# 取 4 留一点余量：既能让后续段提前 ready（消除「读完一句等 2-3 秒」），又不至于撞限流。
+TTS_CONCURRENCY = 4
 
 TURN_KEY_RE = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -47,8 +50,12 @@ TURN_KEY_RE = re.compile(r"[^A-Za-z0-9_-]")
 _SENT_END = "。！？；\n"
 # 分句阈值
 MIN_SEG_CHARS = 10
-MAX_SEG_CHARS = 80
-HARD_SPLIT_CHARS = 120
+# ⚠️ 段长直接决定「一顿一顿」的次数：35 段就是 34 次切换机会。
+#    80 字时一条长回复切成 35 段，播放端每段都要重新 prepare，实测段间仍有空隙；
+#    放宽到 200 字后同一篇约 14 段，切换次数砍掉 60%，听感连续得多。
+#    首句延迟不受影响（第一段仍然是第一个自然句），只有当整段只有一个巨长句时才变长。
+MAX_SEG_CHARS = 200
+HARD_SPLIT_CHARS = 260
 
 
 def voice_enabled() -> bool:
@@ -409,16 +416,27 @@ def register_voice_routes(app, ctx: dict) -> None:
             pass
 
     async def _synth_all(turn: str, segs: list, voice: str, key: str) -> None:
-        """后台逐段合成。串行（实测并行无收益），任何异常只记日志不外抛。
+        """后台合成。**并发**（不是串行）——这是消除「读完一句等 2-3 秒」的关键。
 
-        ⚠️ finally 里必须把自己从 _tts_jobs 摘掉 —— 否则同一 turn 永远起不来新任务，
-           客户端会一直轮询到超时。
+        实测 SiliconFlow：8 段串行 17.8s / 并发3 7.4s / 并发5 3.7s。
+        串行时客户端播到第 3 段时后面的还没合成，只能 BUFFERING 干等，
+        表现就是一停一顿。并发后播第一段的那 2-3 秒里，后面十几段已经 ready。
+
+        任何异常只记日志不外抛；finally 必须把自己从 _tts_jobs 摘掉，
+        否则同一 turn 永远起不来新任务，客户端会一直轮询到超时。
         """
+        sem = asyncio.Semaphore(TTS_CONCURRENCY)
+
+        async def one(client, seg: dict) -> None:
+            async with sem:
+                await _synth_one(client, turn, seg["idx"], seg["text"], voice, key)
+
         try:
             async with make_client(60.0, False) as client:
-                for seg in segs:
-                    await _synth_one(client, turn, seg["idx"], seg["text"], voice, key)
-            print(f"[Voice] 后台合成完成 turn={turn} segs={len(segs)}", flush=True)
+                await asyncio.gather(
+                    *[one(client, s) for s in segs], return_exceptions=True)
+            print(f"[Voice] 后台合成完成 turn={turn} segs={len(segs)} "
+                  f"concurrency={TTS_CONCURRENCY}", flush=True)
         except asyncio.CancelledError:
             print(f"[Voice] 后台合成被取消 turn={turn}", flush=True)
             raise
