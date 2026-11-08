@@ -69,6 +69,13 @@ MIN_SEG_CHARS = 10
 #    首句延迟不受影响（第一段仍然是第一个自然句），只有当整段只有一个巨长句时才变长。
 MAX_SEG_CHARS = 200
 HARD_SPLIT_CHARS = 260
+# ⚠️ 每段「目标长度」：凑够这么多字才切一段（而不是遇到句号就切）。
+#    一句一段时，每段都是独立合成的完成句 —— 语调各自起落，连起来就是
+#    「一句一句念」，切换生硬。凑到 180 字（约 12-15 秒音频、5-8 句）后，
+#    段内语调连贯，段数也砍掉一大半（同一个 26 段的回复会降到 ~10 段）。
+TARGET_SEG_CHARS = 180
+# 首段目标（短）：点朗读后要尽快出声，见 split_sentences 注释
+FIRST_SEG_CHARS = 60
 
 
 def voice_enabled() -> bool:
@@ -114,10 +121,13 @@ def trim_tail_silence(data: bytes) -> bytes:
     """
     if _FFMPEG is None or len(data) < 3000:
         return data
+    # 过渡静音：开头留 60ms、结尾留 120ms。
+    # ⚠️ 别裁到 0 —— 裁干净听起来是「硬切」，段与段之间生硬还容易带咔哒声；
+    #    正常说话的句间停顿本来就是 0.2~0.4s，留 0.18s（尾 0.12 + 首 0.06）最自然。
     filt = ("silenceremove=start_periods=1:start_duration=0.1:"
-            "start_threshold=-45dB:start_silence=0.05,"
+            "start_threshold=-45dB:start_silence=0.06,"
             "areverse,silenceremove=start_periods=1:start_duration=0.1:"
-            "start_threshold=-45dB:start_silence=0.05,areverse")
+            "start_threshold=-45dB:start_silence=0.12,areverse")
     try:
         r = subprocess.run(
             [_FFMPEG, "-hide_banner", "-loglevel", "error",
@@ -340,19 +350,20 @@ def split_sentences(text: str) -> list:
         if piece.strip():
             expanded.append(piece.strip())
 
-    # 过短的向下合并
+    # 按句累积：凑够目标长度才切一段（段内含多句 → 语调连贯）。
+    # ⚠️ 首段目标特意短（60 字）：点朗读后要尽快出声，等 180 字合成完是 5-6 秒，
+    #    用户会以为没反应。后续段用 180 字，保证长段语调连贯、切换次数少。
     merged = []
+    cur = ""
+    target = FIRST_SEG_CHARS
     for s in expanded:
-        if merged and len(merged[-1]) < MIN_SEG_CHARS:
-            merged[-1] = (merged[-1] + s)
-            continue
-        if len(s) < MIN_SEG_CHARS and merged:
-            merged[-1] = merged[-1] + s
-        else:
-            merged.append(s)
-    if len(merged) >= 2 and len(merged[-1]) < MIN_SEG_CHARS:
-        merged[-2] = merged[-2] + merged[-1]
-        merged.pop()
+        cur = (cur + s) if len(cur) > 0 else s
+        if len(cur) >= target:
+            merged.append(cur)
+            cur = ""
+            target = TARGET_SEG_CHARS
+    if cur.strip():
+        merged.append(cur)
 
     out = []
     for s in merged[:MAX_SEGS_PER_TURN]:
