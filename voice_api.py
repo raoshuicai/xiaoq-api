@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -61,6 +62,63 @@ HARD_SPLIT_CHARS = 260
 def voice_enabled() -> bool:
     """服务端总开关：回滚时置 XIAOQ_VOICE_ENABLED=0 重启即可，客户端零改动。"""
     return os.environ.get("XIAOQ_VOICE_ENABLED", "1").strip() != "0"
+
+
+# ── 段尾静音裁剪（实测：TTS 输出普遍带 0.38~0.45s 尾巴）─────────────────
+# ⚠️ 这是「朗读一顿一顿」的真正元凶，跟引擎无关：
+#    每段尾静音 0.45s + 下一段首静音 0.08s ≈ 0.53s 空白，听起来就是读一句停半秒。
+#    双缓冲只能消掉「文件切换」那段开销，消不掉音频内容里的静音。
+#    做法：反转 → 裁掉"开头"静音（即原来的结尾）→ 反转回来。
+#    用 areverse 而不是 silenceremove 的 stop_periods：后者会把句中停顿一起吃掉
+#    （实测 13.85s 被裁成 0.67s）。
+def _find_ffmpeg() -> Optional[str]:
+    import shutil
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    cand = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                        "hermes", "tools")
+    try:
+        for name in sorted(os.listdir(cand)):
+            if name.startswith("ffmpeg-"):
+                exe = os.path.join(cand, name, "bin", "ffmpeg.exe")
+                if os.path.isfile(exe):
+                    return exe
+    except OSError:
+        pass
+    return None
+
+
+_FFMPEG = _find_ffmpeg()
+
+
+def trim_tail_silence(data: bytes) -> bytes:
+    """裁掉段首 + 段尾静音。失败时原样返回（绝不因为裁剪失败而丢掉音频）。
+
+    ⚠️ 首尾都要裁：实测同一引擎不同段的首静音在 0.08~0.45s 之间跳，
+       只裁尾部的话，段间空白就变成「上一段尾巴 0s + 下一段头 0.45s」——
+       照样一顿一顿。两处都用 start_periods=1（只处理各一段），
+       句中自然停顿不受影响。
+    """
+    if _FFMPEG is None or len(data) < 3000:
+        return data
+    filt = ("silenceremove=start_periods=1:start_duration=0.1:"
+            "start_threshold=-45dB:start_silence=0.05,"
+            "areverse,silenceremove=start_periods=1:start_duration=0.1:"
+            "start_threshold=-45dB:start_silence=0.05,areverse")
+    try:
+        r = subprocess.run(
+            [_FFMPEG, "-hide_banner", "-loglevel", "error",
+             "-f", "mp3", "-i", "pipe:0",
+             "-af", filt,
+             "-b:a", "128k", "-f", "mp3", "pipe:1"],
+            input=data, capture_output=True, timeout=25)
+        if r.returncode == 0 and len(r.stdout) > 1000:
+            return r.stdout
+        print(f"[Voice] 裁静音失败 rc={r.returncode}，用原音频", flush=True)
+    except Exception as e:      # noqa: BLE001
+        print(f"[Voice] 裁静音异常: {e}", flush=True)
+    return data
 
 
 def _api_key() -> str:
@@ -350,6 +408,9 @@ def register_voice_routes(app, ctx: dict) -> None:
             print(f"[Voice] TTS 返回过小 turn={turn} idx={idx} bytes={len(data)}", flush=True)
             return {"idx": idx, "text": text, "duration_ms": 0, "status": "failed"}
 
+        # 裁掉段尾静音 —— 实测 TTS 输出带 0.38~0.45s 尾巴，
+        # 段间拼接时就是「读完一句停半秒」（用户反馈的"一顿一顿"）。
+        data = trim_tail_silence(data)
         mp3.write_bytes(data)
         dur = mp3_duration_ms(data)
         try:
