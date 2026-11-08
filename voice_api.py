@@ -17,12 +17,14 @@
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
 import re
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +36,16 @@ SILICONFLOW_BASE = "https://api.siliconflow.cn/v1"
 ASR_MODEL = "FunAudioLLM/SenseVoiceSmall"          # 免费
 TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"          # ¥50/M tokens
 DEFAULT_VOICE = "claire"
+
+# ── TTS 引擎选择（2026-11-08 用户听感对比后换成豆包）───────────────────
+#   doubao      : 火山 Seed-TTS 2.0（商业级，音色明显比开源 CosyVoice2 自然）
+#   siliconflow : CosyVoice2-0.5B（开源小模型，便宜但自然度差一档）
+# 用环境变量切，改完重启即可，不用改代码。
+TTS_PROVIDER = os.environ.get("XIAOQ_TTS_PROVIDER", "doubao").strip().lower()
+DOUBAO_TTS_URL = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+DOUBAO_RESOURCE_ID = "seed-tts-2.0"
+DOUBAO_VOICE = os.environ.get("XIAOQ_DOUBAO_VOICE",
+                              "zh_female_zhixingnv_uranus_bigtts").strip()
 ALLOWED_VOICES = {"alex", "anna", "bella", "benjamin", "charles",
                   "claire", "david", "diana"}
 
@@ -123,6 +135,62 @@ def trim_tail_silence(data: bytes) -> bytes:
 
 def _api_key() -> str:
     return (os.environ.get("SILICONFLOW_API_KEY") or "").strip()
+
+
+def _doubao_key() -> str:
+    return (os.environ.get("DOUBAO_TTS_API_KEY") or "").strip()
+
+
+async def doubao_synth(client, text: str) -> bytes:
+    """豆包 Seed-TTS 2.0 合成，返回完整 mp3 字节。
+
+    ⚠️ 必须逐行解析（`aiter_lines`），**不能**按 chunk 抠 `"data"`：
+       流式响应的 chunk 边界会把一个 JSON 字段切两半 → 正则匹配失败 → 静默丢音频。
+       实测同一段文字：逐 chunk 解析只拿到 52KB/6.65s，逐行是 67.7KB/8.66s（丢 23%）。
+    """
+    key = _doubao_key()
+    if not key:
+        raise RuntimeError("DOUBAO_TTS_API_KEY 未配置")
+    headers = {
+        "X-Api-Key": key,
+        "X-Api-Resource-Id": DOUBAO_RESOURCE_ID,
+        "X-Api-Request-Id": str(uuid.uuid4()),
+        "Content-Type": "application/json",
+    }
+    payload = {"req_params": {
+        "text": text,
+        "speaker": DOUBAO_VOICE,
+        "audio_params": {"format": "mp3", "sample_rate": 24000},
+    }}
+    buf = b""
+    async with client.stream("POST", DOUBAO_TTS_URL,
+                             json=payload, headers=headers) as resp:
+        if resp.status_code != 200:
+            body = await resp.aread()
+            raise RuntimeError(f"doubao {resp.status_code}: {body[:160]!r}")
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            for m in re.finditer(r'"data":"([^"]+)"', line):
+                try:
+                    buf += base64.b64decode(m.group(1))
+                except Exception:
+                    pass
+    return buf
+
+
+async def siliconflow_synth(client, text: str, voice: str, key: str) -> bytes:
+    """CosyVoice2（备选引擎）。"""
+    if not key:
+        raise RuntimeError("SILICONFLOW_API_KEY 未配置")
+    r = await client.post(
+        f"{SILICONFLOW_BASE}/audio/speech",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": TTS_MODEL, "voice": f"{TTS_MODEL}:{voice}",
+              "input": text, "response_format": "mp3"})
+    if r.status_code != 200:
+        raise RuntimeError(f"siliconflow {r.status_code}: {r.text[:160]}")
+    return r.content or b""
 
 
 # ── MP3 时长解析（纯 Python，避免为每段起一次 ffprobe）────────────────
@@ -388,22 +456,15 @@ def register_voice_routes(app, ctx: dict) -> None:
             except Exception:
                 pass
 
-        payload = {"model": TTS_MODEL, "voice": f"{TTS_MODEL}:{voice}",
-                   "input": text, "response_format": "mp3"}
         try:
-            r = await client.post(f"{SILICONFLOW_BASE}/audio/speech",
-                                  headers={"Authorization": f"Bearer {key}"},
-                                  json=payload)
-        except Exception as e:
-            print(f"[Voice] TTS 网络异常 turn={turn} idx={idx}: {e}", flush=True)
+            if TTS_PROVIDER == "doubao":
+                data = await doubao_synth(client, text)
+            else:
+                data = await siliconflow_synth(client, text, voice, key)
+        except Exception as e:      # noqa: BLE001
+            print(f"[Voice] TTS 合成失败 turn={turn} idx={idx} "
+                  f"provider={TTS_PROVIDER}: {e}", flush=True)
             return {"idx": idx, "text": text, "duration_ms": 0, "status": "failed"}
-
-        if r.status_code != 200:
-            print(f"[Voice] TTS 失败 turn={turn} idx={idx} "
-                  f"status={r.status_code} body={r.text[:200]}", flush=True)
-            return {"idx": idx, "text": text, "duration_ms": 0, "status": "failed"}
-
-        data = r.content or b""
         if len(data) < 1024:
             print(f"[Voice] TTS 返回过小 turn={turn} idx={idx} bytes={len(data)}", flush=True)
             return {"idx": idx, "text": text, "duration_ms": 0, "status": "failed"}
