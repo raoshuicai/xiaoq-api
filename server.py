@@ -380,6 +380,28 @@ def get_upload(name: str):
     return FileResponse(str(target))
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  语音 API（ASR + 分段 TTS）—— 小Q APP 语音消息功能 P0
+#
+#  独立模块 voice_api.py，这里只做注册。三个原因：
+#    1) 把对 server.py 的改动压到最小，出问题删掉这段就回滚；
+#    2) 语音模块 import/初始化异常绝不能拖垮主服务 → try/except 兜住；
+#    3) 总开关 XIAOQ_VOICE_ENABLED=0 时所有 /api/asr、/api/tts/* 返回 404，
+#       客户端零改动即可整体下线。
+#  契约见 vault: 04-Projects/03-XiaoQ/20261108_小QAPP语音消息功能_V3_施工版.md §2.1
+# ══════════════════════════════════════════════════════════════════════
+try:
+    from voice_api import register_voice_routes
+    register_voice_routes(app, {
+        "check_auth": check_auth,
+        "upload_dir": UPLOAD_DIR,
+        "make_client": _httpx_async_client,
+        "safe_name": _safe_upload_name,
+    })
+except Exception as _voice_err:      # noqa: BLE001 —— 语音挂了也必须让主服务起来
+    print(f"[Voice] 注册失败，语音功能不可用（其余功能正常）: {_voice_err}", flush=True)
+
+
 @app.get("/api/files")
 def list_files(request: Request, path: str = Query("", description="Obsidian 内相对路径")):
     """列出目录内容（Obsidian 只读浏览）"""
@@ -941,8 +963,58 @@ def _init_push_db():
             updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
         )
     """)
+    # 每台设备各自的「已补推到的最大 push_messages.id」。
+    # 取代原先的全局游标文件 ~/.hermes/last_auto_push_id.txt（单游标 + 只比 id 的后果：
+    # 广播实时送达的消息、以及别的设备已经收到的消息，重连时会被再播一遍）。
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS push_cursors (
+            client_id TEXT PRIMARY KEY,
+            last_id INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours'))
+        )
+    """)
     db.commit()
     db.close()
+
+
+def _push_cursor_get(client_id: str) -> int:
+    """该设备已收到的最大 push id；没有记录时回落到全局游标文件（新设备从「当前」开始，避免一次性灌几百条）。"""
+    if client_id:
+        try:
+            db = sqlite3.connect(str(PUSH_DB))
+            row = db.execute(
+                "SELECT last_id FROM push_cursors WHERE client_id = ?", (client_id,)
+            ).fetchone()
+            db.close()
+            if row is not None:
+                return int(row[0] or 0)
+        except Exception as e:
+            print(f"[PushCursor] get error: {e}")
+    try:
+        f = Path(os.path.expanduser("~/.hermes/last_auto_push_id.txt"))
+        return int(f.read_text().strip()) if f.exists() else 0
+    except Exception:
+        return 0
+
+
+def _push_cursor_set(client_id: str, last_id: int) -> None:
+    """只前进不后退：同一设备重连/乱序写入都不会把游标往回拨。"""
+    if not client_id or not last_id or int(last_id) <= 0:
+        return
+    try:
+        db = sqlite3.connect(str(PUSH_DB))
+        db.execute(
+            "INSERT INTO push_cursors (client_id, last_id, updated_at) "
+            "VALUES (?, ?, datetime('now', '+8 hours')) "
+            "ON CONFLICT(client_id) DO UPDATE SET "
+            "last_id = MAX(push_cursors.last_id, excluded.last_id), "
+            "updated_at = excluded.updated_at",
+            (client_id, int(last_id)),
+        )
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[PushCursor] set error: {e}")
 
 _init_push_db()
 
@@ -1030,9 +1102,11 @@ async def push_message(request: Request, background_tasks: BackgroundTasks):
     except Exception as e:
         print(f"[PushKit] offline_chats write error: {e}")
     await push_events.broadcast(message)
+    # 带上 id：APP 可用来去重/标已读，服务端也据此推进每台设备的 push 游标
     await manager.broadcast({
-        "type": "notification", "title": title, "body": text_with_time, "source": source
-    })
+        "type": "notification", "id": msg_id, "title": title,
+        "body": text_with_time, "source": source
+    }, advance_push_cursor=True)
 
     return {"status": "ok", "message": message}
 
@@ -2634,12 +2708,21 @@ class ConnectionManager:
                 return False
         return False
 
-    async def broadcast(self, message: dict):
+    async def broadcast(self, message: dict, advance_push_cursor: bool = False):
+        """广播给所有连接。
+
+        advance_push_cursor=True 时（推送消息专用），对**成功送达**的每个 client
+        推进它自己的 push 游标 —— 这样重连时不会再把它已经实时收到的消息重播一遍。
+        发失败的连接不推进，下次连上来照常补推。
+        """
         async with self.lock:
             connections = list(self.active_connections.items())
+        push_id = message.get("id") if advance_push_cursor else None
         for cid, ws in connections:
             try:
                 await ws.send_json(message)
+                if isinstance(push_id, int):
+                    _push_cursor_set(cid, push_id)
             except Exception:
                 await self.disconnect(cid)
 
@@ -2653,15 +2736,12 @@ async def websocket_push(websocket: WebSocket):
     try:
         # 发送连接成功确认
         await websocket.send_json({"type": "connected", "client_id": client_id})
-        # 自动补推未读推送消息（增量：只推上次重连之后的新消息）
+        # 自动补推未读推送消息（增量：只推这台设备上次之后的新消息）
         try:
             last_id_file = Path(os.path.expanduser("~/.hermes/last_auto_push_id.txt"))
-            last_id = 0
-            if last_id_file.exists():
-                try:
-                    last_id = int(last_id_file.read_text().strip())
-                except ValueError:
-                    pass
+            # 按设备取游标（push_cursors 表）；该设备没有记录时回落到全局文件，
+            # 使新设备从「当前最新」开始，不会被历史消息灌爆。
+            last_id = _push_cursor_get(client_id)
 
             db = sqlite3.connect(str(PUSH_DB))
             unread = db.execute(
@@ -2683,9 +2763,17 @@ async def websocket_push(websocket: WebSocket):
 
             if unread:
                 new_last_id = unread[-1][0]
-                last_id_file.parent.mkdir(parents=True, exist_ok=True)
-                last_id_file.write_text(str(new_last_id))
-                print(f"[WS] Auto-pushed {len(unread)} new notifications (id {unread[0][0]}→{new_last_id}) to {client_id}")
+                # 该设备自己的游标前进（下次重连不会重播这一批）
+                _push_cursor_set(client_id, new_last_id)
+                # 全局文件只作为「新设备首次连接」的起点参考，继续维护
+                try:
+                    last_id_file.parent.mkdir(parents=True, exist_ok=True)
+                    last_id_file.write_text(str(new_last_id))
+                except Exception:
+                    pass
+                print(f"[WS] Auto-pushed {len(unread)} new notifications "
+                      f"(id {unread[0][0]}→{new_last_id}) to {client_id} "
+                      f"[cursor {last_id}→{new_last_id}]")
         except Exception as e:
             print(f"[WS] Auto-push error: {e}")
         # 保持连接，等待消息
